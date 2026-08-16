@@ -8,6 +8,7 @@ import { spawn, ChildProcess, execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { config } from '../config';
+import * as chatState from '../db/ChatStateStore';
 import type { Logger } from '../logger';
 
 export interface ClaudeRunResult {
@@ -36,7 +37,9 @@ interface StreamEvent {
  * messages resume it with --resume so context carries over.
  */
 export class ClaudeCodeBridge {
-  private sessions = new Map<number, string>(); // chatId -> claude session id
+  // Session IDs persist via ChatStateStore (SQLite) so a chat's Claude Code session survives
+  // an app restart — the CLI's own on-disk session storage already has the conversation, this
+  // just needs to remember which session ID belongs to which chat across process lifetimes.
   private running = new Map<number, ChildProcess>(); // chatId -> active process
   private logger?: Logger;
   /** Port of the local ApprovalHookServer, set once it's listening (index.ts). 0 = not wired yet. */
@@ -106,11 +109,11 @@ export class ClaudeCodeBridge {
   }
 
   hasSession(chatId: number): boolean {
-    return this.sessions.has(chatId);
+    return chatState.getClaudeSession(chatId) !== undefined;
   }
 
   clearSession(chatId: number): void {
-    this.sessions.delete(chatId);
+    chatState.clearClaudeSession(chatId);
   }
 
   cancel(chatId: number): boolean {
@@ -149,7 +152,7 @@ export class ClaudeCodeBridge {
       });
     }
 
-    const sessionId = this.sessions.get(chatId);
+    const sessionId = chatState.getClaudeSession(chatId);
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
     if (sessionId) {
       args.push('--resume', sessionId);
@@ -199,7 +202,7 @@ export class ClaudeCodeBridge {
         if (settled) return;
         settled = true;
         this.running.delete(chatId);
-        if (newSessionId) this.sessions.set(chatId, newSessionId);
+        if (newSessionId) chatState.setClaudeSession(chatId, newSessionId);
         this.logger?.info(
           { chatId, success: result.success, ms: result.durationMs, session: newSessionId },
           'claude run end'

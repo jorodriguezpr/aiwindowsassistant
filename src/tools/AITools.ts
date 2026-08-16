@@ -12,6 +12,10 @@ import * as os from 'os';
 import { config } from '../config';
 import type { ToolDefinition } from '../providers/AIProvider';
 import type { ClaudeCodeBridge } from './ClaudeCodeBridge';
+import { SYSADMIN_TOOL_DEFINITIONS, SYSADMIN_TOOL_NAMES, executeSysAdminTool } from './SysAdminTools';
+import { EMAIL_TOOL_DEFINITIONS, executeEmailTool } from './EmailTools';
+import { PDF_TOOL_DEFINITIONS, executePdfTool } from './PdfTools';
+import { saveNote as saveNoteToDb } from '../db/NotesStore';
 
 const execAsync = promisify(exec);
 
@@ -57,7 +61,7 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /\bRemove-Partition\b/i,
 ];
 
-const DESTRUCTIVE_TOOLS = new Set(['delete_file', 'stop_process']);
+const DESTRUCTIVE_TOOLS = new Set(['delete_file', 'stop_process', 'service_control', 'firewall_rule_manage', 'send_email']);
 
 export function isDestructiveCommand(command: string): boolean {
   return DESTRUCTIVE_PATTERNS.some((re) => re.test(command));
@@ -193,6 +197,23 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       required: ['prompt'],
     },
   },
+  {
+    name: 'save_note',
+    description:
+      'Save a durable fact worth recalling in future conversations — infrastructure details, preferences, ' +
+      'recurring patterns. Not for transient task details. Shown back to you as a digest on future runs.',
+    parameters: {
+      type: 'object',
+      properties: {
+        summary: { type: 'string' },
+        tags: { type: 'string', description: 'Optional comma-separated tags' },
+      },
+      required: ['summary'],
+    },
+  },
+  ...SYSADMIN_TOOL_DEFINITIONS,
+  ...EMAIL_TOOL_DEFINITIONS,
+  ...PDF_TOOL_DEFINITIONS,
 ];
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'out', 'coverage', '$RECYCLE.BIN']);
@@ -239,9 +260,22 @@ export class AIToolExecutor {
         return this.getSystemInfo();
       case 'delegate_to_claude_code':
         return this.delegateToClaudeCode(String(args.prompt || ''), args.cwd ? String(args.cwd) : undefined, ctx);
+      case 'save_note':
+        return this.saveNote(String(args.summary || ''), args.tags ? String(args.tags) : undefined);
+      case 'send_email':
+        return executeEmailTool(name, args);
+      case 'generate_pdf':
+        return executePdfTool(name, args);
       default:
+        if (SYSADMIN_TOOL_NAMES.has(name)) return executeSysAdminTool(name, args);
         return { success: false, error: `Unknown tool: ${name}` };
     }
+  }
+
+  private saveNote(summary: string, tags?: string): ToolResult {
+    if (!summary.trim()) return { success: false, error: 'Empty summary' };
+    const id = saveNoteToDb(summary.trim(), tags, 'ai');
+    return { success: true, output: `Saved note #${id}` };
   }
 
   private async executeCommand(command: string, cwd?: string): Promise<ToolResult> {

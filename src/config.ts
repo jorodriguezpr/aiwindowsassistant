@@ -9,11 +9,17 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 
-dotenv.config();
+// Inside a pkg-packaged binary, __dirname resolves into pkg's read-only virtual
+// snapshot filesystem, not the real directory the .exe lives in on disk — any
+// writable state (data/, logs/, .env, and the loose scripts/claude-approval-hook.js
+// the Claude Code hook invokes externally) must resolve against the real exe
+// location instead. `process.pkg` is set by the pkg runtime when packaged.
+const IS_PKG = !!(process as unknown as { pkg?: unknown }).pkg;
+const PROJECT_ROOT = IS_PKG ? path.dirname(process.execPath) : path.resolve(__dirname, '..');
+
+dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
 
 export type ProviderName = 'anthropic' | 'ollama-cloud' | 'ollama';
-
-const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 function env(key: string, def = ''): string {
   const v = process.env[key];
@@ -86,6 +92,16 @@ export const config = {
     // Estimate threshold (tokens) before summarizing history, same idea as AiAgentAssistant
     summarizeThresholdTokens: 50000,
     historyKeepMessages: 10,
+    documentsDir: env('DOCUMENTS_DIR', path.join(os.homedir(), 'Documents', 'AiWindowsAssistant')),
+  },
+
+  email: {
+    host: env('EMAIL_SMTP_HOST'),
+    port: envInt('EMAIL_SMTP_PORT', 587),
+    secure: env('EMAIL_SMTP_SECURE', 'false').toLowerCase() === 'true',
+    user: env('EMAIL_SMTP_USER'),
+    pass: env('EMAIL_SMTP_PASS'),
+    from: env('EMAIL_FROM'),
   },
 
   autoStart: env('AUTO_START', 'false').toLowerCase() === 'true',

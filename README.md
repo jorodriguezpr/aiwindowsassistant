@@ -29,6 +29,17 @@ Sole contributor: Jose Rodriguez Arroyo.
   runs, with a 5-minute timeout.
 - **Windows-native autostart** — one flag registers a hidden launcher in the current user's
   registry `Run` key; no service install, no elevation required.
+- **Persists across restarts** — conversation history, Claude Code sessions, and parked
+  (iteration-cap) state are stored in a local SQLite database, not just in memory.
+- **Curated sysadmin tools** for the local-model engine — disk usage, processes, services,
+  event-log errors, network info, firewall rules, scheduled tasks, installed software, startup
+  programs — structured output instead of composing raw PowerShell for common admin checks.
+- **Send-only email and PDF generation** — `send_email` and `generate_pdf` tools (no inbox
+  reading).
+- **Recurring automation via real Windows Task Scheduler** (`/schedule`) — runs even when the app
+  isn't open; always unattended, so destructive actions are skipped rather than approved.
+- **Cross-task knowledge base** (`/remember`, `/notes`) — durable notes shared by both engines,
+  independent of Claude Code's own separate per-project `MEMORY.md` continuity.
 - **Token usage tracking** and structured logging with automatic secret redaction.
 
 ## Requirements
@@ -86,6 +97,8 @@ Security notes).
 | `CLAUDE_WORKSPACE` | Folder Claude Code operates in when you delegate a task |
 | `CLAUDE_PERMISSION_MODE` | Must be `bypassPermissions` for the Claude Code engine to actually execute tool calls headlessly — this app's own Telegram approval hook is the real safety gate, not Claude Code's built-in prompts (which have no terminal to prompt through in headless mode) |
 | `AUTO_START` | `true` to register the Windows autostart launcher on boot |
+| `DOCUMENTS_DIR` | Where `generate_pdf` writes files. Defaults to `Documents\AiWindowsAssistant` |
+| `EMAIL_SMTP_HOST` / `_PORT` / `_SECURE` / `_USER` / `_PASS` / `EMAIL_FROM` | SMTP config for `send_email` — leave `EMAIL_SMTP_HOST` empty to disable the tool entirely (send-only, no inbox reading) |
 
 Full list with defaults: see [`.env.example`](.env.example).
 
@@ -104,6 +117,10 @@ Full list with defaults: see [`.env.example`](.env.example).
 | `/clear` | Reset conversation + Claude Code session for this chat |
 | `/cancel` | Cancel the currently running task |
 | `/pause` / `/resume` | Stop/resume processing new messages |
+| `/remember <fact>` | Save a durable note (both engines see it) |
+| `/notes [search]` | List/search saved notes |
+| `/schedule add <name> <daily HH:mm\|weekly <day> HH:mm\|hourly> <prompt>` | Register a recurring task via Windows Task Scheduler |
+| `/schedule list` / `/schedule remove <id>` | Manage your scheduled tasks |
 
 Or just type naturally — fast local actions run instantly, anything else is delegated.
 
@@ -119,6 +136,10 @@ Or just type naturally — fast local actions run instantly, anything else is de
   is an accepted tradeoff for a single-owner tool, not an oversight — know it before relying on it.
 - **No secrets in logs**: an allowlist-based log serializer strips anything shaped like an API key
   or auth header before it can reach the log files, even on request failures.
+- **Scheduled tasks always run unattended**: a Task Scheduler-fired run has no live Telegram
+  channel to approve anything through, so destructive tool calls are automatically denied rather
+  than blocking forever or silently auto-approving. `/schedule` is meant for read-only/reporting
+  prompts, not tasks that need a human in the loop.
 - **This app grants real control of your PC** to anyone with access to the allowed Telegram
   account(s) — treat the bot token and your Telegram account security accordingly.
 
@@ -127,15 +148,16 @@ Or just type naturally — fast local actions run instantly, anything else is de
 This is a deliberately small, single-owner tool, not a full platform. Known gaps:
 
 - **Telegram only** — no Discord/WhatsApp/web chat gateways.
-- **No email, PDF generation, or scheduled/recurring automation** (no cron-like task scheduler).
-- **No task persistence across restarts** — an in-progress task is lost if the app restarts;
-  conversation history and Claude Code sessions are in-memory per chat.
-- **No built-in sysadmin tool library** beyond raw PowerShell via `execute_command` — the AI
-  composes commands itself rather than choosing from curated, structured tools.
-- **No cross-task learning/knowledge base** — each conversation starts fresh (aside from Claude
-  Code's own per-chat session resume).
+- **Email is send-only** — no inbox reading/monitoring.
+- **The sysadmin tool library is curated (~10 tools)**, not exhaustive — the AI still falls back to
+  raw PowerShell via `execute_command` for anything not covered, and these structured tools are
+  only reachable via the local-model engine (`/ai`, `/engine ollama`); the default Claude Code
+  engine uses its own separate built-in tools and doesn't consume this library at all.
 - **No multi-step planning engine** — the local-model engine runs a flat tool-calling loop, not a
   dependency-graph/parallel plan executor; Claude Code's own planning is used as-is.
+- **The knowledge base (`/remember`, `/notes`) is a flat note store**, not the original's
+  auto-learning-from-successful-runs machinery — saving a note is explicit (the AI or the user
+  choosing to), not automatic pattern extraction.
 - **Windows-only** — PowerShell-based tooling, registry-based autostart, Windows path conventions.
 - **No web/API interface** — control is exclusively through Telegram.
 

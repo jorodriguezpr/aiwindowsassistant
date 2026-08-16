@@ -15,7 +15,25 @@ import { RequestAnalyzer } from '../core/RequestAnalyzer';
 import { Orchestrator } from '../core/Orchestrator';
 import { getUsageSummary } from '../utils/tokenUsage';
 import { isAutostartEnabled } from '../utils/autostart';
+import * as chatState from '../db/ChatStateStore';
+import { saveNote, listRecentNotes, searchNotes } from '../db/NotesStore';
+import { createScheduledTask, listScheduledTasks, deleteScheduledTask, getScheduledTask } from '../db/ScheduleStore';
+import { parseScheduleDesc, registerWindowsTask, unregisterWindowsTask } from '../services/SchedulerService';
 import type { Logger } from '../logger';
+
+/** Splits off the first N whitespace-separated tokens, preserving the untouched remainder
+ * (needed for /schedule add, whose trailing prompt argument is free text). */
+function splitTokens(s: string, n: number): { tokens: string[]; rest: string } {
+  const re = /\S+/g;
+  const tokens: string[] = [];
+  let m: RegExpExecArray | null;
+  let lastEnd = 0;
+  while (tokens.length < n && (m = re.exec(s))) {
+    tokens.push(m[0]);
+    lastEnd = re.lastIndex;
+  }
+  return { tokens, rest: s.slice(lastEnd).trim() };
+}
 
 interface PendingApproval {
   chatId: number;
@@ -40,6 +58,11 @@ const HELP_TEXT = `*AiWindowsAssistant* — delegate tasks from your phone 🤖
 /clear — Reset conversation + Claude Code session
 /cancel — Cancel the running task
 /pause, /resume — Pause/resume the bot
+/remember <fact> — Save a durable note (both engines see it)
+/notes [search] — List/search saved notes
+/schedule add <name> <daily HH:mm|weekly <day> HH:mm|hourly> <prompt> — Recurring task (real Windows Task Scheduler, runs even if this app isn't open — always unattended, destructive actions are skipped)
+/schedule list — List your scheduled tasks
+/schedule remove <id> — Remove one
 /help — This list
 
 Or just type naturally — fast local actions run instantly (e.g. "open notepad", "system info"), anything else is delegated to Claude Code.`;
@@ -199,6 +222,106 @@ export class TelegramGateway {
       this.setPaused(false);
       await ctx.reply('▶️ Resumed. What task would you like to delegate?');
     });
+
+    this.bot.command('remember', async (ctx) => {
+      const text = this.commandArgs(ctx);
+      if (!text) return ctx.reply('Usage: /remember <fact to save>');
+      const id = saveNote(text, undefined, 'user');
+      await ctx.reply(`✅ Saved note #${id}.`);
+    });
+
+    this.bot.command('notes', async (ctx) => {
+      const q = this.commandArgs(ctx);
+      const notes = q ? searchNotes(q) : listRecentNotes(20);
+      if (notes.length === 0) return ctx.reply(q ? `No notes matching "${q}".` : 'No notes saved yet. Use /remember <fact> to add one.');
+      const lines = notes.map((n) => `#${n.id} (${n.createdAt.slice(0, 10)}) ${n.summary}${n.tags ? ` [${n.tags}]` : ''}`);
+      await this.sendLong(ctx.chat.id, lines.join('\n'));
+    });
+
+    this.bot.command('schedule', async (ctx) => this.handleSchedule(ctx));
+  }
+
+  private async handleSchedule(ctx: Context): Promise<void> {
+    const chatId = ctx.chat!.id;
+    const args = this.commandArgs(ctx);
+    const { tokens: subTokens, rest: afterSub } = splitTokens(args, 1);
+    const sub = (subTokens[0] || '').toLowerCase();
+
+    if (sub === 'list') {
+      const tasks = listScheduledTasks(chatId);
+      if (tasks.length === 0) return void ctx.reply('No scheduled tasks. Add one: /schedule add <name> <daily HH:mm|weekly <day> HH:mm|hourly> <prompt>');
+      const lines = tasks.map(
+        (t) =>
+          `#${t.id} "${t.name}" — ${t.scheduleDesc} (${t.engine})${t.enabled ? '' : ' [disabled]'}` +
+          (t.lastRunAt ? `\n   last run: ${t.lastRunAt}` : '')
+      );
+      await this.sendLong(chatId, lines.join('\n\n'));
+      return;
+    }
+
+    if (sub === 'remove') {
+      const id = parseInt(afterSub, 10);
+      if (!Number.isFinite(id)) return void ctx.reply('Usage: /schedule remove <id>');
+      const task = getScheduledTask(id);
+      if (!task || task.chatId !== chatId) return void ctx.reply('Task not found.');
+      unregisterWindowsTask(id);
+      deleteScheduledTask(id);
+      await ctx.reply(`🗑 Removed scheduled task #${id} ("${task.name}").`);
+      return;
+    }
+
+    if (sub === 'add') {
+      const { tokens: nameTok, rest: afterName } = splitTokens(afterSub, 1);
+      const name = nameTok[0];
+      if (!name) {
+        await ctx.reply('Usage: /schedule add <name> <daily HH:mm|weekly <day> HH:mm|hourly> <prompt>');
+        return;
+      }
+      const kindMatch = afterName.match(/^(hourly|daily|weekly)\b\s*([\s\S]*)$/i);
+      if (!kindMatch) {
+        await ctx.reply('Schedule must start with hourly, daily HH:mm, or weekly <DAY> HH:mm — e.g. "daily 09:00".');
+        return;
+      }
+      const kind = kindMatch[1].toLowerCase();
+      let scheduleDesc: string;
+      let prompt: string;
+      if (kind === 'hourly') {
+        scheduleDesc = 'hourly';
+        prompt = kindMatch[2].trim();
+      } else if (kind === 'daily') {
+        const { tokens: t, rest } = splitTokens(kindMatch[2], 1);
+        scheduleDesc = `daily ${t[0] || ''}`;
+        prompt = rest;
+      } else {
+        const { tokens: t, rest } = splitTokens(kindMatch[2], 2);
+        scheduleDesc = `weekly ${t[0] || ''} ${t[1] || ''}`;
+        prompt = rest;
+      }
+      const spec = parseScheduleDesc(scheduleDesc);
+      if (!spec) {
+        await ctx.reply(`Invalid schedule "${scheduleDesc}". Examples: hourly | daily 09:00 | weekly MON 09:00`);
+        return;
+      }
+      if (!prompt) {
+        await ctx.reply('Missing the prompt to run — it comes after the schedule.');
+        return;
+      }
+      const id = createScheduledTask(chatId, name, scheduleDesc, prompt, this.defaultEngine);
+      try {
+        registerWindowsTask(id, spec);
+      } catch (err) {
+        deleteScheduledTask(id);
+        await ctx.reply(`❌ Failed to register with Windows Task Scheduler: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      await ctx.reply(
+        `✅ Scheduled "${name}" (#${id}) — ${scheduleDesc}, engine: ${this.defaultEngine}.\n` +
+          'Runs unattended (even if this app is closed) — destructive actions are automatically skipped, not approved.'
+      );
+      return;
+    }
+
+    await ctx.reply('Usage: /schedule add <name> <daily HH:mm|weekly <day> HH:mm|hourly> <prompt> | /schedule list | /schedule remove <id>');
   }
 
   private setupHandlers(): void {
@@ -301,25 +424,32 @@ export class TelegramGateway {
 
   /** Direct single-tool execution (used by /execute and the local fast path). */
   private async runToolDirect(chatId: number, tool: string, args: Record<string, unknown>, description: string): Promise<void> {
-    if (isDestructiveToolCall(tool, args)) {
-      const approved = await this.requestApproval(chatId, `⚠️ *Destructive action*\n${description}`);
-      if (!approved) {
-        await this.bot.telegram.sendMessage(chatId, '❌ Denied.');
-        return;
+    const pendingId = chatState.startPendingTask(chatId, description);
+    let ok = false;
+    try {
+      if (isDestructiveToolCall(tool, args)) {
+        const approved = await this.requestApproval(chatId, `⚠️ *Destructive action*\n${description}`);
+        if (!approved) {
+          await this.bot.telegram.sendMessage(chatId, '❌ Denied.');
+          return;
+        }
       }
+      await this.sendTyping(chatId);
+      const result = await this.executor.execute(tool, JSON.stringify(args), {
+        chatId,
+        claudeBridge: this.claudeBridge,
+        requestApproval: (d) => this.requestApproval(chatId, d),
+        onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+      });
+      ok = result.success;
+      const out = result.success
+        ? `✅ ${description}\n${String(result.output ?? result.stdout ?? 'Done.')}`
+        : `❌ ${description}\n${result.error || 'Failed'}${result.stderr ? '\n' + result.stderr : ''}`;
+      await this.sendLong(chatId, out);
+      await this.bot.telegram.sendMessage(chatId, 'What task would you like to delegate next?');
+    } finally {
+      chatState.finishPendingTask(pendingId, ok ? 'done' : 'failed');
     }
-    await this.sendTyping(chatId);
-    const result = await this.executor.execute(tool, JSON.stringify(args), {
-      chatId,
-      claudeBridge: this.claudeBridge,
-      requestApproval: (d) => this.requestApproval(chatId, d),
-      onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
-    });
-    const out = result.success
-      ? `✅ ${description}\n${String(result.output ?? result.stdout ?? 'Done.')}`
-      : `❌ ${description}\n${result.error || 'Failed'}${result.stderr ? '\n' + result.stderr : ''}`;
-    await this.sendLong(chatId, out);
-    await this.bot.telegram.sendMessage(chatId, 'What task would you like to delegate next?');
   }
 
   /**
@@ -330,18 +460,25 @@ export class TelegramGateway {
    * which waits on the outer one finishing first).
    */
   private async runClaudeTask(chatId: number, prompt: string): Promise<void> {
-    await this.sendTyping(chatId);
-    await this.sendProgress(chatId, '🤖 Claude Code is working…');
-    const result = await this.claudeBridge.run(chatId, prompt, {
-      onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
-    });
-    await this.clearProgress(chatId);
-    if (result.success) {
-      await this.sendLong(chatId, result.output || '✅ Done (no output).');
-    } else {
-      await this.sendLong(chatId, `❌ Claude Code failed: ${result.error}${result.output ? '\n\n' + result.output : ''}`);
+    const pendingId = chatState.startPendingTask(chatId, prompt);
+    let ok = false;
+    try {
+      await this.sendTyping(chatId);
+      await this.sendProgress(chatId, '🤖 Claude Code is working…');
+      const result = await this.claudeBridge.run(chatId, prompt, {
+        onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+      });
+      await this.clearProgress(chatId);
+      ok = result.success;
+      if (result.success) {
+        await this.sendLong(chatId, result.output || '✅ Done (no output).');
+      } else {
+        await this.sendLong(chatId, `❌ Claude Code failed: ${result.error}${result.output ? '\n\n' + result.output : ''}`);
+      }
+      await this.bot.telegram.sendMessage(chatId, 'Anything else to delegate?');
+    } finally {
+      chatState.finishPendingTask(pendingId, ok ? 'done' : 'failed');
     }
-    await this.bot.telegram.sendMessage(chatId, 'Anything else to delegate?');
   }
 
   // ---------- approvals ----------

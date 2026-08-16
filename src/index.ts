@@ -12,11 +12,19 @@ import { ApprovalHookServer } from './tools/ApprovalHookServer';
 import { Orchestrator } from './core/Orchestrator';
 import { TrayIcon } from './tray/TrayIcon';
 import { addAutostart, isAutostartEnabled } from './utils/autostart';
+import { getDb } from './db/Database';
+import { getRunningPendingTasks, finishPendingTask } from './db/ChatStateStore';
 
 async function main(): Promise<void> {
   ensureDirectories();
   const logger = createLogger();
   logger.info({ host: HOSTNAME, pid: process.pid }, 'AiWindowsAssistant starting');
+
+  getDb(); // open + migrate before anything else touches persisted state
+  const interrupted = getRunningPendingTasks();
+  if (interrupted.length > 0) {
+    logger.warn({ count: interrupted.length }, 'found tasks still marked running from a previous session — likely an unclean shutdown');
+  }
 
   const problems = validateConfig();
   for (const p of problems) logger.warn(p);
@@ -110,6 +118,16 @@ async function main(): Promise<void> {
   await gateway.notifyOwner(
     `✅ *AiWindowsAssistant* is running on ${HOSTNAME}.\nWhat task would you like to delegate?`
   );
+
+  if (interrupted.length > 0) {
+    const lines = interrupted.map((t) => `• #${t.id} (chat ${t.chatId}, started ${t.createdAt}): ${t.description}`);
+    await gateway.notifyOwner(
+      `⚠️ Found ${interrupted.length} task(s) still marked "running" from before the last restart — ` +
+        `likely lost to an unclean shutdown, not resumed automatically:\n${lines.join('\n')}`
+    );
+    for (const t of interrupted) finishPendingTask(t.id, 'failed');
+  }
+
   logger.info('AiWindowsAssistant ready');
 }
 
