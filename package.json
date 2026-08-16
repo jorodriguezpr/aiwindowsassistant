@@ -1,6 +1,6 @@
 {
   "name": "aiwindowsassistant",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Windows 11 port of AiAgentAssistant — Telegram-controlled AI assistant with Claude Code bridge, running from the system tray",
   "main": "dist/index.js",
   "author": {
