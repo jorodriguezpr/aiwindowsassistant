@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.secure
+logs/
+data/
+assets/icon.ico
+*.log
