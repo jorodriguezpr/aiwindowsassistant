@@ -104,6 +104,37 @@ export const config = {
     from: env('EMAIL_FROM'),
   },
 
+  // Fleet Guardian escalation worker: polls SysAdminCenterHCP for ClaudeEscalation rows this
+  // desktop's Claude Code should investigate. Off unless a URL + key are both set — an empty
+  // baseUrl means "not configured", not "poll nothing forever against an empty string".
+  escalation: {
+    baseUrl: env('SYSADMIN_CENTER_HCP_URL').replace(/\/+$/, ''),
+    workerApiKey: env('ESCALATION_WORKER_API_KEY'),
+    pollIntervalMs: envInt('ESCALATION_POLL_INTERVAL_MS', 30000),
+    // JSON map of contextRepo key -> absolute local path, e.g.
+    // {"sysadminhcp":"C:\\PhpProjects\\kloxo-8.0.0-25\\sysadminhcp","sysadmincenterhcp":"C:\\PhpProjects\\SysAdminCenterHCP"}
+    repoPaths: (() => {
+      try {
+        return JSON.parse(env('ESCALATION_REPO_PATHS', '{}')) as Record<string, string>;
+      } catch {
+        return {} as Record<string, string>;
+      }
+    })(),
+  },
+
+  // BJavaDecompiler AI delegation worker: polls BJavaDecompiler for prompts its own AI providers
+  // (Ollama Cloud/local, OpenAI) can be swapped out for — AI_PROVIDER=ai-delegation there hands
+  // reconstruction/remediation prompts to this desktop's authenticated Claude Code instead. A
+  // separate queue/poller from the Guardian escalation one above: these prompts are pure text
+  // reconstruction with zero real-world side effects (no server access, no destructive tool
+  // calls), so unlike Guardian's escalations they never need a Telegram approve/deny tap — see
+  // BJavaDecompilerPollService.ts. Off unless a URL + key are both set.
+  bjavaDecompiler: {
+    baseUrl: env('BJAVADECOMPILER_URL').replace(/\/+$/, ''),
+    workerApiKey: env('BJAVADECOMPILER_WORKER_API_KEY'),
+    pollIntervalMs: envInt('BJAVADECOMPILER_POLL_INTERVAL_MS', 15000),
+  },
+
   autoStart: env('AUTO_START', 'false').toLowerCase() === 'true',
 
   log: {

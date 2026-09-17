@@ -9,6 +9,8 @@ import { createLogger } from './logger';
 import { TelegramGateway } from './gateways/TelegramGateway';
 import { ClaudeCodeBridge } from './tools/ClaudeCodeBridge';
 import { ApprovalHookServer } from './tools/ApprovalHookServer';
+import { EscalationPollService } from './services/EscalationPollService';
+import { BJavaDecompilerPollService } from './services/BJavaDecompilerPollService';
 import { Orchestrator } from './core/Orchestrator';
 import { TrayIcon } from './tray/TrayIcon';
 import { addAutostart, isAutostartEnabled } from './utils/autostart';
@@ -65,6 +67,20 @@ async function main(): Promise<void> {
     logger.warn('Claude Code CLI not found — delegate_to_claude_code and /claude will report an error. Install: npm install -g @anthropic-ai/claude-code');
   }
 
+  // Fleet Guardian escalation worker — polls SysAdminCenterHCP for pending "ask Claude Code"
+  // requests it can't reach this PC to push directly (no inbound connectivity). No-ops if
+  // SYSADMIN_CENTER_HCP_URL / ESCALATION_WORKER_API_KEY aren't configured.
+  const escalationPoller = new EscalationPollService(claudeBridge, gateway, logger);
+  escalationPoller.start();
+
+  // BJavaDecompiler AI delegation worker — polls BJavaDecompiler for prompts its own AI
+  // reconstruction/remediation pass hands off to this desktop's Claude Code (AI_PROVIDER=
+  // ai-delegation there). No-ops if BJAVADECOMPILER_URL / BJAVADECOMPILER_WORKER_API_KEY
+  // aren't configured. No Telegram approval gate — these prompts are pure text reconstruction
+  // with zero real-world side effects, unlike a Guardian escalation.
+  const bjavaDecompilerPoller = new BJavaDecompilerPollService(claudeBridge, gateway, logger);
+  bjavaDecompilerPoller.start();
+
   // Tray icon
   const tray = new TrayIcon(
     {
@@ -97,6 +113,8 @@ async function main(): Promise<void> {
     }
     gateway.stop(reason);
     approvalServer.stop();
+    escalationPoller.stop();
+    bjavaDecompilerPoller.stop();
     await tray.kill();
     process.exit(0);
   };

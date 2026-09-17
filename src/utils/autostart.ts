@@ -12,6 +12,8 @@ import { config } from '../config';
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const VALUE_NAME = 'AiWindowsAssistant';
 
+const IS_PKG = !!(process as unknown as { pkg?: unknown }).pkg;
+
 /** Hidden launcher so node runs without a console window at login. */
 function vbsPath(): string {
   return path.join(config.projectRoot, 'scripts', 'start-hidden.vbs');
@@ -19,14 +21,19 @@ function vbsPath(): string {
 
 export function writeHiddenLauncher(): string {
   const vbs = vbsPath();
-  const nodeExe = process.execPath.replace(/\\/g, '\\\\');
-  const entry = path.join(config.projectRoot, 'dist', 'index.js').replace(/\\/g, '\\\\');
   const workDir = config.projectRoot.replace(/\\/g, '\\\\');
+  // Packaged (pkg) builds ship as a single self-contained .exe with no dist/index.js
+  // on disk — run it directly. Dev/gitdeploy checkouts run via node + dist/index.js.
+  const runLine = IS_PKG
+    ? `sh.Run """${process.execPath.replace(/\\/g, '\\\\')}""", 0, False\n`
+    : `sh.Run """${process.execPath.replace(/\\/g, '\\\\')}"" ""${path
+        .join(config.projectRoot, 'dist', 'index.js')
+        .replace(/\\/g, '\\\\')}""", 0, False\n`;
   const content =
     `' AiWindowsAssistant hidden launcher\n` +
     `Set sh = CreateObject("WScript.Shell")\n` +
     `sh.CurrentDirectory = "${workDir}"\n` +
-    `sh.Run """${nodeExe}"" ""${entry}"""", 0, False\n`;
+    runLine;
   fs.mkdirSync(path.dirname(vbs), { recursive: true });
   fs.writeFileSync(vbs, content, 'ascii');
   return vbs;

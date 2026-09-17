@@ -24,9 +24,12 @@ function isWithinWorkspace(filePath: string): boolean {
   return resolved === root || resolved.startsWith(root + path.sep);
 }
 
-/** Mirrors AITools.ts's destructive-tool gating, applied to Claude Code's own built-in tools. */
+/** Mirrors AITools.ts's destructive-tool gating, applied to Claude Code's own built-in tools.
+ * PowerShell is Claude Code's separate Windows command-execution tool (distinct from Bash) —
+ * isDestructiveCommand's pattern list already covers PowerShell cmdlets (Remove-Item,
+ * Stop-Computer, etc.), so the same check applies verbatim. */
 function isDestructiveClaudeToolCall(toolName: string, toolInput: Record<string, unknown>): boolean {
-  if (toolName === 'Bash' && typeof toolInput.command === 'string') {
+  if ((toolName === 'Bash' || toolName === 'PowerShell') && typeof toolInput.command === 'string') {
     return isDestructiveCommand(toolInput.command);
   }
   if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') && typeof toolInput.file_path === 'string') {
@@ -38,7 +41,7 @@ function isDestructiveClaudeToolCall(toolName: string, toolInput: Record<string,
 }
 
 function describeToolCall(toolName: string, toolInput: Record<string, unknown>): string {
-  if (toolName === 'Bash') return `Run: ${String(toolInput.command || '').slice(0, 150)}`;
+  if (toolName === 'Bash' || toolName === 'PowerShell') return `Run: ${String(toolInput.command || '').slice(0, 150)}`;
   if (typeof toolInput.file_path === 'string') return `${toolName}: ${toolInput.file_path}`;
   return `${toolName}(${JSON.stringify(toolInput).slice(0, 120)})`;
 }

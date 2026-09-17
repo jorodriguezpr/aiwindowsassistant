@@ -15,7 +15,8 @@ Sole contributor: Jose Rodriguez Arroyo.
 ## What it does
 
 - **Telegram bot, tray app** — no console window, controllable entirely from your phone. Lives in
-  the Windows system tray with pause/resume, a test-message button, and quick links to logs/config.
+  the Windows system tray with pause/resume, a test-message button, a "Start with Windows"
+  checkbox, and quick links to logs/config.
 - **Two execution engines, switchable at runtime** (`/engine claude|ollama`):
   - **Claude Code** (default) — delegates to the real `claude` CLI headlessly, one resumable
     session per Telegram chat, with full agentic file/coding/shell capability.
@@ -27,8 +28,9 @@ Sole contributor: Jose Rodriguez Arroyo.
   destructive-looking (deleting files, stopping processes, risky shell commands, edits reaching
   outside the configured workspace) through an inline Approve/Deny prompt in Telegram before it
   runs, with a 5-minute timeout.
-- **Windows-native autostart** — one flag registers a hidden launcher in the current user's
-  registry `Run` key; no service install, no elevation required.
+- **Windows-native autostart** — toggle from the tray menu, or set the `AUTO_START` flag; either
+  registers a hidden launcher in the current user's registry `Run` key, no service install or
+  elevation required.
 - **Persists across restarts** — conversation history, Claude Code sessions, and parked
   (iteration-cap) state are stored in a local SQLite database, not just in memory.
 - **Curated sysadmin tools** for the local-model engine — disk usage, processes, services,

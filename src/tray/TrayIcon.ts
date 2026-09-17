@@ -9,6 +9,7 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import SysTray, { MenuItem } from 'systray2';
 import { config } from '../config';
+import { addAutostart, isAutostartEnabled, removeAutostart } from '../utils/autostart';
 import type { Logger } from '../logger';
 
 export interface TrayCallbacks {
@@ -27,10 +28,16 @@ export class TrayIcon {
   private systray: SysTray | null = null;
   private paused = false;
   private statusText = 'Starting…';
+  private autostartEnabled = false;
   private logger?: Logger;
 
   constructor(private callbacks: TrayCallbacks, logger?: Logger) {
     this.logger = logger;
+    try {
+      this.autostartEnabled = isAutostartEnabled();
+    } catch (err) {
+      this.logger?.warn({ err }, 'failed to read autostart state');
+    }
   }
 
   private loadIconBase64(): string {
@@ -58,6 +65,13 @@ export class TrayIcon {
       { title: '📂 Open logs folder', tooltip: config.logDir, checked: false, enabled: true },
       { title: '⚙ Open config (.env)', tooltip: 'Edit configuration', checked: false, enabled: true },
       { title: SEPARATOR, tooltip: '', checked: false, enabled: true },
+      {
+        title: '🚀 Start with Windows',
+        tooltip: 'Launch AiWindowsAssistant automatically at login',
+        checked: this.autostartEnabled,
+        enabled: true,
+      },
+      { title: SEPARATOR, tooltip: '', checked: false, enabled: true },
       { title: '❌ Quit', tooltip: 'Stop AiWindowsAssistant', checked: false, enabled: true },
     ];
     return {
@@ -81,6 +95,8 @@ export class TrayIcon {
         exec(`explorer.exe "${config.logDir}"`);
       } else if (title.includes('config')) {
         exec(`notepad.exe "${path.join(config.projectRoot, '.env')}"`);
+      } else if (title.includes('Start with Windows')) {
+        this.toggleAutostart();
       } else if (title.includes('Quit')) {
         this.callbacks.onQuit();
       }
@@ -88,6 +104,23 @@ export class TrayIcon {
 
     await this.systray.ready();
     this.logger?.info('tray icon started');
+  }
+
+  private toggleAutostart(): void {
+    try {
+      if (this.autostartEnabled) {
+        removeAutostart();
+        this.autostartEnabled = false;
+        this.logger?.info('autostart disabled from tray');
+      } else {
+        addAutostart();
+        this.autostartEnabled = true;
+        this.logger?.info('autostart enabled from tray');
+      }
+    } catch (err) {
+      this.logger?.warn({ err }, 'failed to toggle autostart from tray');
+    }
+    void this.refresh();
   }
 
   setPaused(paused: boolean): void {

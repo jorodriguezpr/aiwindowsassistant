@@ -27,6 +27,9 @@ const OUT = path.join(ROOT, 'gitdeploy');
 const DIRS = ['src', 'scripts'];
 // Individual files copied as-is.
 const FILES = ['package.json', 'package-lock.json', 'tsconfig.json', '.gitignore', '.env.example', 'README.md', 'LICENSE'];
+// Generated-at-runtime files that can land inside an otherwise-source directory
+// (e.g. scripts/) — these bake in this machine's absolute paths and must never ship.
+const EXCLUDE_PATHS = [path.join('scripts', 'start-hidden.vbs')];
 
 function clean(dir) {
   // Never touch .git — this runs on every rebuild and must not destroy repo
@@ -45,7 +48,10 @@ function main() {
   clean(OUT);
 
   for (const d of DIRS) {
-    fs.cpSync(path.join(ROOT, d), path.join(OUT, d), { recursive: true });
+    fs.cpSync(path.join(ROOT, d), path.join(OUT, d), {
+      recursive: true,
+      filter: (src) => !EXCLUDE_PATHS.includes(path.relative(ROOT, src)),
+    });
   }
   for (const f of FILES) {
     const src = path.join(ROOT, f);
