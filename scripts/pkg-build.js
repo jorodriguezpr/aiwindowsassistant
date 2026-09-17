@@ -48,6 +48,7 @@ function main() {
   fs.mkdirSync(path.join(OUT_DIR, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(OUT_DIR, 'assets'), { recursive: true });
   fs.copyFileSync(path.join(ROOT, 'scripts', 'claude-approval-hook.js'), path.join(OUT_DIR, 'scripts', 'claude-approval-hook.js'));
+  fs.copyFileSync(path.join(ROOT, 'scripts', 'claude-readonly-hook.js'), path.join(OUT_DIR, 'scripts', 'claude-readonly-hook.js'));
   fs.copyFileSync(path.join(ROOT, 'assets', 'icon.ico'), path.join(OUT_DIR, 'assets', 'icon.ico'));
   for (const f of looseFiles) {
     const src = path.join(ROOT, f);
@@ -55,7 +56,7 @@ function main() {
   }
 
   console.log(`\npkg-dist/ ready at ${OUT_DIR}`);
-  console.log('Contents: AiWindowsAssistant.exe, scripts/claude-approval-hook.js, .env.example, README.md, LICENSE');
+  console.log('Contents: AiWindowsAssistant.exe, scripts/claude-approval-hook.js, scripts/claude-readonly-hook.js, .env.example, README.md, LICENSE');
   console.log('To run: copy .env.example to .env next to the exe, edit it, then run AiWindowsAssistant.exe.');
 }
 
