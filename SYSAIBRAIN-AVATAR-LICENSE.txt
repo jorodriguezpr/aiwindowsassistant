@@ -1,0 +1,42 @@
+SYSAIBRAIN AVATAR LICENSE — FOR USE ONLY WITH AIWINDOWSASSISTANT
+
+Copyright (c) 2026 Jose Rodriguez Arroyo. All rights reserved.
+SysAiBrain — https://sysaibrain.com — Micro Computer Repair Services — http://www.microrepair.net
+
+1. What this covers
+   The SysAiBrain avatar ("the Avatar") included with AiWindowsAssistant: the binary file
+   assets/sysaibrain/avatar.bin and everything it contains or produces when running (the
+   avatar's program code, head model, appearance and animation). The Avatar is commercial
+   software. It is NOT covered by the AiWindowsAssistant MIT license.
+
+2. What you may do
+   You may use the Avatar only as part of AiWindowsAssistant, unmodified, as installed by the
+   AiWindowsAssistant installer or release package, on computers where you use AiWindowsAssistant.
+
+3. What you may not do
+   You may not, and may not let anyone else:
+   a) use the Avatar, or any part of it, outside AiWindowsAssistant or with any other software,
+      website, product or service;
+   b) extract, decrypt, decompile, disassemble or reverse engineer the Avatar, or try to obtain
+      its source code, model data or any other content from avatar.bin or from AiWindowsAssistant
+      while it runs;
+   c) copy, modify, adapt, translate, or make works based on the Avatar or its appearance;
+   d) distribute, sell, rent, lend, sublicense or publish the Avatar separately from
+      AiWindowsAssistant, or remove or change this license or the attribution to SysAiBrain
+      (the "sysaibrain.com" link in the AiWindowsAssistant chat window).
+   Any other use requires a separate commercial license: https://sysaibrain.com/license
+
+4. Ownership
+   The Avatar is licensed, not sold. All rights, title and interest in it remain with
+   Jose Rodriguez Arroyo. This license grants no rights to SysAiBrain's name, logo or other
+   software.
+
+5. Termination
+   This license ends automatically if you break any of its terms. You must then stop using the
+   Avatar and remove it (uninstalling AiWindowsAssistant does this).
+
+6. No warranty, limitation of liability
+   The Avatar is provided "as is", without warranty of any kind. To the maximum extent permitted
+   by law, the author is not liable for any damages arising from its use.
+
+Contact: support@sysaibrain.com · https://sysaibrain.com/contact

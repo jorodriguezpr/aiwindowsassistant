@@ -162,6 +162,15 @@ export const config = {
     longTaskSeconds: envInt('TOAST_LONG_TASK_SECONDS', 60),
   },
 
+  // Which engine does the work (services/EngineSettings.ts). Claude Code by default; the
+  // assistant engine (AI_PROVIDER, e.g. Ollama Cloud, with this app's own tools) is opt-in:
+  //   DEFAULT_ENGINE — your messages and /task · WORKER_ENGINE — BJavaDecompiler + Fleet Guardian work
+  // claude | assistant. /engine and /workers switch them at runtime (kept across restarts).
+  engines: {
+    tasks: (['assistant', 'ollama', 'ollama-cloud', 'local'].includes(env('DEFAULT_ENGINE').toLowerCase()) ? 'assistant' : 'claude') as 'claude' | 'assistant',
+    workers: (['assistant', 'ollama', 'ollama-cloud', 'local'].includes(env('WORKER_ENGINE').toLowerCase()) ? 'assistant' : 'claude') as 'claude' | 'assistant',
+  },
+
   // Proactive alerts (AlertService): disk full, Defender detections, crashes, new startup
   // programs/services/scheduled tasks… without asking. /alerts off|on at runtime.
   alerts: {

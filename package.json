@@ -1,6 +1,6 @@
 {
   "name": "aiwindowsassistant",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Windows 11 port of AiAgentAssistant — Telegram-controlled AI assistant with Claude Code bridge, running from the system tray",
   "main": "dist/main.js",
   "author": {
@@ -19,10 +19,10 @@
   "bin": "dist/main.js",
   "scripts": {
     "dev": "ts-node src/index.ts",
-    "build": "tsc && npm run icon",
+    "build": "tsc && npm run icon && node scripts/avatar-pack.js",
     "icon": "node scripts/generate-icon.js",
     "start": "node dist/index.js",
-    "test": "tsc && node --test tests/security.test.js tests/windows.test.js tests/assistant15.test.js",
+    "test": "tsc && node --test tests/security.test.js tests/windows.test.js tests/assistant15.test.js tests/engine16.test.js",
     "protect-secrets": "node dist/index.js --protect-secrets",
     "install-helper": "node dist/index.js --install-helper",
     "uninstall-helper": "node dist/index.js --uninstall-helper",
@@ -34,8 +34,12 @@
   },
   "license": "MIT",
   "pkg": {
-    "assets": ["node_modules/systray2/traybin/tray_windows_release.exe"],
-    "targets": ["node22-win-x64"],
+    "assets": [
+      "node_modules/systray2/traybin/tray_windows_release.exe"
+    ],
+    "targets": [
+      "node22-win-x64"
+    ],
     "outputPath": "pkg-dist"
   },
   "dependencies": {
@@ -57,6 +61,7 @@
     "@types/pdfkit": "^0.17.6",
     "@types/uuid": "^9.0.7",
     "@yao-pkg/pkg": "^6.22.0",
+    "esbuild": "^0.28.2",
     "ts-node": "^10.9.1",
     "tslib": "^2.6.2",
     "typescript": "^5.3.3"

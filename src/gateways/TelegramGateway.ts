@@ -17,6 +17,7 @@ import { AIToolExecutor } from '../tools/AITools';
 import { gateToolCall, grant } from '../security/Gate';
 import { MCP_TOOL_NAMES } from '../mcp/McpServer';
 import { listRoutines } from '../services/RepairService';
+import { getEngine, setEngine, parseEngine, engineLabel } from '../services/EngineSettings';
 import type { WebChat } from './WebChat';
 import type { AlertService } from '../services/AlertService';
 import { ClaudeCodeBridge } from '../tools/ClaudeCodeBridge';
@@ -73,7 +74,8 @@ const HELP_TEXT = `*AiWindowsAssistant* — delegate tasks from your phone 🤖
 /claude <prompt> — Send straight to Claude Code (no history, session resumes per chat)
 /execute <cmd> — Run a PowerShell command
 /ai <text> — Force this one request through the local model, regardless of default engine
-/engine [claude|ollama] — Show/switch the default engine for plain text and /task
+/engine [claude|assistant] — Show/switch the engine for your messages: Claude Code (default) or the assistant engine (AI_PROVIDER, e.g. Ollama Cloud)
+/workers [claude|assistant] — Same for BJavaDecompiler delegations and Fleet Guardian escalations
 /provider [anthropic|ollama-cloud|ollama] — Show/switch AI provider (used by the local-model engine)
 /aimodel [model] — Show/change model
 /status — Bot, provider, Claude CLI, queue status
@@ -118,7 +120,7 @@ export class TelegramGateway {
   private startedAt = Date.now();
   private botUsername = '';
   /** Which engine handles plain text / /task by default — switchable via /engine. */
-  private defaultEngine: 'claude' | 'ollama' = 'claude';
+  private defaultEngine: 'claude' | 'ollama' = getEngine('tasks') === 'claude' ? 'claude' : 'ollama';
 
   private approvalServer: ApprovalHookServer | null = null;
   /** Windows notifications: approvals with Approve/Deny at the PC, long-task completions. */
@@ -244,10 +246,29 @@ export class TelegramGateway {
 
     this.bot.command('engine', async (ctx) => {
       const arg = this.commandArgs(ctx).toLowerCase();
-      if (!arg) return ctx.reply(`Current default engine: *${this.defaultEngine}* (used by plain text and /task)`, { parse_mode: 'Markdown' });
-      if (arg !== 'claude' && arg !== 'ollama') return ctx.reply('Usage: /engine claude|ollama');
-      this.defaultEngine = arg;
-      await ctx.reply(`✅ Default engine set to *${this.defaultEngine}*. Plain text and /task will use it from now on.`, { parse_mode: 'Markdown' });
+      if (!arg) {
+        return ctx.reply(
+          `Your messages and /task run on: ${engineLabel(getEngine('tasks'))}\n` +
+            `BJavaDecompiler / Fleet Guardian work runs on: ${engineLabel(getEngine('workers'))}\n\n` +
+            '/engine claude | assistant — your messages\n/workers claude | assistant — delegated work\n' +
+            '(assistant = this app\'s own engine with AI_PROVIDER, e.g. Ollama Cloud; claude = Claude Code, the default)'
+        );
+      }
+      const e = parseEngine(arg, getEngine('tasks'));
+      if (!['claude', 'claude-code', 'assistant', 'ollama', 'ollama-cloud', 'local'].includes(arg)) return ctx.reply('Usage: /engine claude | assistant');
+      setEngine('tasks', e);
+      this.defaultEngine = e === 'claude' ? 'claude' : 'ollama';
+      await ctx.reply(`✅ Your messages and /task now run on ${engineLabel(e)}. (Kept after restarts.)`);
+    });
+
+    this.bot.command('workers', async (ctx) => {
+      const arg = this.commandArgs(ctx).toLowerCase();
+      if (!['claude', 'claude-code', 'assistant', 'ollama', 'ollama-cloud', 'local'].includes(arg)) {
+        return ctx.reply(`BJavaDecompiler / Fleet Guardian work runs on: ${engineLabel(getEngine('workers'))}\nUsage: /workers claude | assistant`);
+      }
+      const e = parseEngine(arg, getEngine('workers'));
+      setEngine('workers', e);
+      await ctx.reply(`✅ BJavaDecompiler delegations and Fleet Guardian escalations now run on ${engineLabel(e)}. (Kept after restarts.)`);
     });
 
     this.bot.command('claude', async (ctx) => {

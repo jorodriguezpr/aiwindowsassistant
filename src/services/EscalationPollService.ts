@@ -30,6 +30,8 @@ import { config, HOSTNAME } from '../config';
 import { ClaudeCodeBridge } from '../tools/ClaudeCodeBridge';
 import type { TelegramGateway } from '../gateways/TelegramGateway';
 import { hookCommand } from '../utils/launcher';
+import { getEngine, engineLabel } from './EngineSettings';
+import { runOnEngine } from './WorkerEngine';
 import type { Logger } from '../logger';
 
 interface PendingEscalation {
@@ -165,9 +167,16 @@ export class EscalationPollService {
 
     const started = Date.now();
     try {
-      const result = await this.claudeBridge.run(syntheticChatId(escalation.id), escalation.prompt, {
+      // Claude Code (default) or, when turned on, the assistant engine — read-only either way
+      const engine = getEngine('workers');
+      const result = await runOnEngine(engine, {
+        chatId: syntheticChatId(escalation.id),
+        prompt: escalation.prompt,
+        mode: 'readonly',
         cwd: escalation.contextRepo ? config.escalation.repoPaths[escalation.contextRepo] : undefined,
+        claudeBridge: this.claudeBridge,
         hookSettingsPath: this.ensureHookSettings(),
+        logger: this.logger,
       });
       await this.submitResult(escalation.id, {
         status: result.success ? 'completed' : 'failed',
@@ -187,8 +196,8 @@ export class EscalationPollService {
       } else {
         await this.gateway.notifyOwner(
           result.success
-            ? `✅ Claude Code escalation finished — ${subject}\n\n${this.tail(result.output)}`
-            : `❌ Claude Code escalation failed — ${subject}: ${result.error}`
+            ? `✅ Escalation finished (${engineLabel(engine)}) — ${subject}\n\n${this.tail(result.output)}`
+            : `❌ Escalation failed (${engineLabel(engine)}) — ${subject}: ${result.error}`
         );
       }
     } catch (err) {

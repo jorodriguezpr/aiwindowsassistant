@@ -21,6 +21,10 @@ import * as crypto from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 import { config } from '../config';
 import { childEnv } from '../security/SecretStore';
+import { chatPage } from './webchatPage';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as zlib from 'zlib';
 import type { Logger } from '../logger';
 
 export interface FeedItem {
@@ -41,46 +45,6 @@ export interface WebChatHooks {
   onButton: (data: string) => boolean;
 }
 
-const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>AiWindowsAssistant</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{color-scheme:light dark;--bg:#f3f4f6;--me:#2563eb;--bot:#fff;--fg:#111;--muted:#6b7280}
-@media (prefers-color-scheme:dark){:root{--bg:#111827;--bot:#1f2937;--fg:#f3f4f6;--muted:#9ca3af}}
-*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;height:100vh}
-#feed{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
-.m{max-width:88%;padding:8px 11px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-.bot{background:var(--bot);align-self:flex-start;box-shadow:0 1px 2px #0002}.me{background:var(--me);color:#fff;align-self:flex-end}
-.note{align-self:center;color:var(--muted);font-size:12px}
-.b{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}.b button{border:0;border-radius:8px;padding:6px 10px;cursor:pointer;background:#e5e7eb}
-.b button.ok{background:#16a34a;color:#fff}.b button.no{background:#dc2626;color:#fff}
-form{display:flex;gap:6px;padding:10px;border-top:1px solid #8883}
-textarea{flex:1;resize:none;height:42px;border-radius:10px;border:1px solid #8885;padding:10px;font:inherit;background:var(--bot);color:var(--fg)}
-form button{border:0;border-radius:10px;padding:0 14px;cursor:pointer;background:var(--me);color:#fff;font-size:16px}
-#mic.on{background:#dc2626}
-</style></head><body>
-<div id="feed"><div class="m note">Same conversation as Telegram. Try "health check", "open bluetooth settings", "/fix".</div></div>
-<form id="f"><button type="button" id="mic" title="Speak">🎤</button><textarea id="t" placeholder="Ask or tell me what to do…" autofocus></textarea><button>➤</button></form>
-<script>
-let last=0;const feed=document.getElementById('feed'),t=document.getElementById('t'),items={};
-function render(it){let el=it.mid&&items[it.mid];if(it.deleted){if(el)el.remove();return}
- if(!el){el=document.createElement('div');feed.appendChild(el);if(it.mid)items[it.mid]=el}
- el.className='m '+it.who;el.textContent=it.text;
- if(it.buttons&&it.buttons.length){const b=document.createElement('div');b.className='b';
-  for(const [label,data] of it.buttons){const x=document.createElement('button');x.textContent=label;
-   x.className=data.startsWith('deny')?'no':'ok';x.onclick=()=>post('/answer',{data}).then(()=>b.remove());b.appendChild(x)}
-  el.appendChild(b)}
- feed.scrollTop=feed.scrollHeight}
-function post(u,body){return fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})}
-async function poll(){try{const r=await fetch('/feed?after='+last);if(r.status===403){render({who:'note',text:'Session expired — press the hotkey again.'});return}
- for(const it of await r.json()){last=Math.max(last,it.n);render(it)}}catch(e){}setTimeout(poll,800)}
-document.getElementById('f').onsubmit=e=>{e.preventDefault();const s=t.value.trim();if(!s)return;t.value='';render({who:'me',text:s});post('/send',{text:s})};
-t.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('f').requestSubmit()}};
-const SR=window.SpeechRecognition||window.webkitSpeechRecognition,mic=document.getElementById('mic');
-if(!SR)mic.style.display='none';else{const r=new SR();r.lang=navigator.language;r.interimResults=true;
- r.onresult=e=>{t.value=[...e.results].map(x=>x[0].transcript).join('')};r.onend=()=>{mic.classList.remove('on');if(t.value.trim())document.getElementById('f').requestSubmit()};
- mic.onclick=()=>{if(mic.classList.contains('on'))r.stop();else{t.value='';mic.classList.add('on');r.start()}}}
-poll();
-</script></body></html>`;
 
 export class WebChat {
   private server: http.Server;
@@ -91,6 +55,8 @@ export class WebChat {
   private feed: FeedItem[] = [];
   private seq = 0;
   private hotkeyProc?: ChildProcess;
+  /** SysAiBrain avatar from the binary pack (assets/sysaibrain/avatar.bin), if this build has it */
+  private avatar: { js: string; mesh: string } | null = loadAvatarPack();
 
   constructor(private hooks: WebChatHooks, private logger?: Logger) {
     this.server = http.createServer((req, res) => this.handle(req, res));
@@ -127,8 +93,17 @@ export class WebChat {
     }
     if (!this.cookieOk(req)) return void res.writeHead(403).end('Open the chat with the hotkey or the tray menu.');
     if (req.method === 'GET' && url.pathname === '/') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'" });
-      return void res.end(PAGE);
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'" });
+      return void res.end(chatPage(!!this.avatar));
+    }
+    // the SysAiBrain avatar renderer and its head mesh, from the pack (only to the signed-in window)
+    if (req.method === 'GET' && this.avatar && url.pathname === '/sab/avatar.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+      return void res.end(this.avatar.js);
+    }
+    if (req.method === 'GET' && this.avatar && url.pathname === '/api/avatar/mesh') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      return void res.end(this.avatar.mesh);
     }
     if (req.method === 'GET' && url.pathname === '/feed') {
       const after = Number(url.searchParams.get('after')) || 0;
@@ -172,7 +147,7 @@ export class WebChat {
 
   /** Opens the chat window (Edge app mode, falls back to the default browser). */
   open(): void {
-    spawn('cmd.exe', ['/c', 'start', '', 'msedge', `--app=${this.url()}`, '--window-size=460,720'], { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv() })
+    spawn('cmd.exe', ['/c', 'start', '', 'msedge', `--app=${this.url()}`, '--window-size=480,880'], { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv() })
       .on('exit', (code) => {
         if (code) spawn('cmd.exe', ['/c', 'start', '', this.url()], { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv() }).unref();
       })
@@ -231,7 +206,7 @@ public class AiwaHotkey : NativeWindow {
   }
   protected override void WndProc(ref Message m) {
     if (m.Msg == 0x0312) {
-      try { Process.Start("msedge.exe", "--app=\"" + url + "\" --window-size=460,720"); } catch { Process.Start(url); }
+      try { Process.Start("msedge.exe", "--app=\"" + url + "\" --window-size=480,880"); } catch { Process.Start(url); }
     }
     base.WndProc(ref m);
   }
@@ -239,3 +214,35 @@ public class AiwaHotkey : NativeWindow {
 '@
 $h = New-Object AiwaHotkey ([uint32]$env:AIWA_HK_MOD), ([uint32]$env:AIWA_HK_VK), $env:AIWA_CHAT_URL, ([int]$env:AIWA_PARENT_PID)
 [System.Windows.Forms.Application]::Run()`;
+
+/** The key of the avatar pack: generated next to the pack at build time (dist/avatar-key.js, inside
+ * the .exe), never part of the source. No key (built from source) = no avatar. */
+function packKey(): Buffer | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('../avatar-key') as Buffer;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * assets/sysaibrain/avatar.bin — the SysAiBrain avatar, licensed only for use inside
+ * AiWindowsAssistant (SYSAIBRAIN-AVATAR-LICENSE.txt): "SABAVTR2" + IV(12) + tag(16) +
+ * AES-256-GCM(gzip(JSON { v, js, mesh })). Decrypted in memory and served only to the signed-in
+ * chat window; never written to disk in readable form. See scripts/avatar-pack.js.
+ */
+export function loadAvatarPack(file = path.join(config.assetsDir, 'sysaibrain', 'avatar.bin'), key: Buffer | null = packKey()): { js: string; mesh: string } | null {
+  try {
+    if (!key) return null;
+    const buf = fs.readFileSync(file);
+    if (buf.subarray(0, 8).toString('latin1') !== 'SABAVTR2') return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(8, 20));
+    decipher.setAuthTag(buf.subarray(20, 36));
+    const plain = Buffer.concat([decipher.update(buf.subarray(36)), decipher.final()]);
+    const pack = JSON.parse(zlib.gunzipSync(plain).toString('utf8')) as { v: number; js: string; mesh: string };
+    return pack.v === 2 && pack.js && pack.mesh ? { js: pack.js, mesh: pack.mesh } : null;
+  } catch {
+    return null; // wrong key, tampered or truncated pack: no avatar
+  }
+}

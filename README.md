@@ -17,7 +17,7 @@ Sole contributor: Jose Rodriguez Arroyo.
 - **Telegram bot, tray app** — no console window, controllable entirely from your phone. Lives in
   the Windows system tray with pause/resume, a test-message button, a "Start with Windows"
   checkbox, and quick links to logs/config.
-- **Two execution engines, switchable at runtime** (`/engine claude|ollama`):
+- **Two execution engines, switchable at runtime** (`/engine claude|assistant`, `/workers claude|assistant`):
   - **Claude Code** (default) — delegates to the real `claude` CLI headlessly, one resumable
     session per Telegram chat, with full agentic file/coding/shell capability.
   - **Local model loop** — a lightweight tool-calling agent against Anthropic, Ollama Cloud, or a
@@ -137,7 +137,7 @@ Full list with defaults: see [`.env.example`](.env.example).
 | `/claude <prompt>` | Send straight to Claude Code (no history, per-chat session resumes) |
 | `/execute <cmd>` | Run a PowerShell command directly |
 | `/ai <text>` | Force this one request through the local-model engine |
-| `/engine [claude\|ollama]` | Show/switch the default engine |
+| `/engine [claude|assistant]` · `/workers [claude|assistant]` | Claude Code (default) or the assistant engine (e.g. Ollama Cloud) for your messages / for delegated work |
 | `/provider [anthropic\|ollama-cloud\|ollama]` | Show/switch the local-model provider |
 | `/aimodel [model]` | Show/change the local model |
 | `/status` | Bot, engine, provider, Claude CLI, and queue status |
@@ -165,12 +165,38 @@ Plain sentences work too, instantly and without AI: "open bluetooth settings", "
 "free up space", "health check", "install vlc", "update all apps", "check for windows updates",
 "fix my printer", "fix the internet", "what windows are open".
 
-### Chat window at the PC (1.5.0)
+### Chat window at the PC, with a talking avatar
 
 **Ctrl+Alt+Space** (`CHAT_HOTKEY`) or the tray menu opens a small window with the same
 conversation as Telegram: type or 🎤 speak, approve with the buttons, everything the bot says to
 you appears in both places. It is a loopback-only page (127.0.0.1) opened through a secret
 per-run link; nothing is reachable from the network.
+
+In the Windows installer / release builds the window shows the **SysAiBrain avatar**
+([sysaibrain.com](https://sysaibrain.com)): it reads the answers aloud with moving lips, and
+**🎙 Conversation** makes it hands-free — it listens, you talk, it answers aloud, and you can
+approve or deny by voice ("approve" / "deny", "aprueba" / "niega"). Voice and listening use the
+browser's built-in speech engines; 🔊 turns the voice off, 🧑 hides the avatar. The avatar is
+commercial SysAiBrain software, licensed **only for use inside AiWindowsAssistant**
+([SYSAIBRAIN-AVATAR-LICENSE.txt](SYSAIBRAIN-AVATAR-LICENSE.txt)) and shipped only as an encrypted
+binary inside the installer / release `.exe` — not covered by this project's MIT license and not
+part of this source code (see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). Builds from source
+have the window without it.
+
+### Claude Code or Ollama Cloud (1.6.0)
+
+By default **Claude Code** does the work. Optionally, the assistant's **own engine** — the
+`AI_PROVIDER` model (e.g. **Ollama Cloud**) with this app's tools, policy and approvals — can do it
+instead, so Claude Code isn't needed:
+
+| | Setting | Switch at runtime |
+|---|---|---|
+| Your messages and `/task` | `DEFAULT_ENGINE=claude\|assistant` | `/engine claude` · `/engine assistant` |
+| BJavaDecompiler delegations + Fleet Guardian escalations | `WORKER_ENGINE=claude\|assistant` | `/workers claude` · `/workers assistant` |
+
+The choice is kept across restarts; the installer has an (unchecked) option for it. On the
+assistant engine, BJavaDecompiler prompts are answered directly by the model (pure text, no
+tools) and escalations stay read-only (only looking tools and read-only commands, never asking).
 
 ### Both engines use the same tools (MCP)
 
@@ -267,9 +293,8 @@ This is a deliberately small, single-owner tool, not a full platform. Known gaps
 - **Telegram only** — no Discord/WhatsApp/web chat gateways.
 - **Email is send-only** — no inbox reading/monitoring.
 - **The sysadmin tool library is curated (~10 tools)**, not exhaustive — the AI still falls back to
-  raw PowerShell via `execute_command` for anything not covered, and these structured tools are
-  only reachable via the local-model engine (`/ai`, `/engine ollama`); the default Claude Code
-  engine uses its own separate built-in tools and doesn't consume this library at all.
+  raw PowerShell via `execute_command` for anything not covered. Since 1.5.0 both engines use
+  this library (the Claude Code engine through the built-in MCP server).
 - **No multi-step planning engine** — the local-model engine runs a flat tool-calling loop, not a
   dependency-graph/parallel plan executor; Claude Code's own planning is used as-is.
 - **The knowledge base (`/remember`, `/notes`) is a flat note store**, not the original's

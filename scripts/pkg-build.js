@@ -47,7 +47,15 @@ function main() {
   fs.mkdirSync(path.join(OUT_DIR, 'assets'), { recursive: true });
   fs.copyFileSync(path.join(ROOT, 'assets', 'icon.ico'), path.join(OUT_DIR, 'assets', 'icon.ico'));
   fs.copyFileSync(path.join(ROOT, 'installer', 'AiWindowsAssistant.vbs'), path.join(OUT_DIR, 'AiWindowsAssistant.vbs'));
-  for (const f of ['.env.example', 'README.md', 'LICENSE']) {
+  // the SysAiBrain avatar ships ONLY as this binary pack (scripts/avatar-pack.js), never as source
+  const avatarPack = path.join(ROOT, 'assets', 'sysaibrain', 'avatar.bin');
+  if (fs.existsSync(avatarPack)) {
+    fs.mkdirSync(path.join(OUT_DIR, 'assets', 'sysaibrain'), { recursive: true });
+    fs.copyFileSync(avatarPack, path.join(OUT_DIR, 'assets', 'sysaibrain', 'avatar.bin'));
+  } else {
+    console.log('note: no SysAiBrain avatar pack — this build has no avatar in the chat window');
+  }
+  for (const f of ['.env.example', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'SYSAIBRAIN-AVATAR-LICENSE.txt']) {
     const src = path.join(ROOT, f);
     if (fs.existsSync(src)) fs.copyFileSync(src, path.join(OUT_DIR, f));
   }

@@ -33,6 +33,8 @@ SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\assets\icon.ico
 UninstallDisplayName={#MyAppName}
 LicenseFile=..\LICENSE
+; the SysAiBrain avatar's own terms (use only inside AiWindowsAssistant), shown before installing
+InfoBeforeFile=..\SYSAIBRAIN-AVATAR-LICENSE.txt
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -48,6 +50,7 @@ VersionInfoDescription={#MyAppName} Setup
 [Tasks]
 Name: "autostart"; Description: "Start AiWindowsAssistant when I sign in to Windows"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+Name: "assistantengine"; Description: "Use Ollama Cloud (the assistant's own engine) instead of Claude Code for my tasks and delegated work — you can switch back any time with /engine and /workers"; Flags: unchecked
 Name: "adminhelper"; Description: "Install the administrator helper (Windows updates, BitLocker, repairs, silent app installs) — Windows asks for permission once"; Flags: unchecked; Check: not HelperInstalled
 Name: "adminhelperupdate"; Description: "Update the administrator helper to this version (Windows asks for permission once)"; Check: HelperInstalled
 
@@ -58,6 +61,10 @@ Source: "..\assets\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\.env.example"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\SYSAIBRAIN-AVATAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; SysAiBrain avatar: commercial, binary pack only (scripts/avatar-pack.js) — https://sysaibrain.com
+Source: "..\assets\sysaibrain\avatar.bin"; DestDir: "{app}\assets\sysaibrain"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{userprograms}\{#MyAppName}\{#MyAppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\AiWindowsAssistant.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Comment: "Start AiWindowsAssistant"
@@ -121,8 +128,8 @@ begin
 
   AiPage := CreateInputOptionPage(TelegramPage.ID,
     'AI', 'Which AI should the assistant use?',
-    'The main engine is Claude Code: it does the real work on this PC. Install it separately and sign in once (it is not part of this installer). ' +
-    'The choice below is for the quick local engine (/ai) and for when Claude Code is not installed.', True, False);
+    'By default Claude Code does the work (install it separately and sign in once — it is not part of this installer). ' +
+    'The AI below is the assistant''s own engine: used for /ai, and for everything if you ticked "Use Ollama Cloud instead of Claude Code" on the previous page.', True, False);
   AiPage.Add('Ollama Cloud (needs an API key from ollama.com)');
   AiPage.Add('Anthropic API (needs an API key)');
   AiPage.Add('Ollama on this PC (no key)');
@@ -202,7 +209,7 @@ begin
     begin Provider := 'ollama'; KeyLine := '# no API key needed for local Ollama'; end;
   end;
   ForceDirectories(WorkPage.Values[0]);
-  SetArrayLength(Lines, 16);
+  SetArrayLength(Lines, 18);
   // first line is a comment: the file may start with a UTF-8 byte order mark
   Lines[0] := '# AiWindowsAssistant settings - written by Setup. All options: .env.example in this folder.';
   Lines[1] := 'TELEGRAM_BOT_TOKEN=' + Trim(TelegramPage.Values[0]);
@@ -220,6 +227,17 @@ begin
   Lines[13] := 'TRUSTED_COMMANDS=';
   Lines[14] := 'SENSITIVE_PATHS=';
   Lines[15] := 'LOG_LEVEL=info';
+  // Claude Code unless the owner opted into the assistant engine (Ollama Cloud) — switchable later with /engine and /workers
+  if WizardIsTaskSelected('assistantengine') then
+  begin
+    Lines[16] := 'DEFAULT_ENGINE=assistant';
+    Lines[17] := 'WORKER_ENGINE=assistant';
+  end
+  else
+  begin
+    Lines[16] := 'DEFAULT_ENGINE=claude';
+    Lines[17] := 'WORKER_ENGINE=claude';
+  end;
   EnvDone := SaveStringsToUTF8File(ExpandConstant('{app}\.env'), Lines, False);
 end;
 
@@ -237,7 +255,7 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = wpFinished) and not ClaudeCodeFound then
+  if (CurPageID = wpFinished) and not ClaudeCodeFound and not WizardIsTaskSelected('assistantengine') then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10 + #13#10 +
       'Claude Code was not found on this PC. The assistant works with its local engine, but for the full experience install Claude Code ' +
       '(https://claude.com/claude-code), run "claude" once to sign in, and start the assistant again.';

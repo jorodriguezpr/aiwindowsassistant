@@ -7,6 +7,7 @@
 import { AIProvider, ChatMessage, ToolCall } from '../providers/AIProvider';
 import { AIToolExecutor, ToolContext, TOOL_DEFINITIONS } from '../tools/AITools';
 import { gateToolCall } from '../security/Gate';
+import { classifyCommand } from '../security/CommandPolicy';
 import { config } from '../config';
 import * as chatState from '../db/ChatStateStore';
 import { listRecentNotes } from '../db/NotesStore';
@@ -19,6 +20,12 @@ export interface LoopCallbacks {
   requestApproval: (description: string, grantKey?: string) => Promise<boolean>;
   /** Progress from long-running tools (Claude Code bridge). */
   onToolProgress?: (text: string) => void;
+  /**
+   * Read-only runs (Fleet Guardian escalations on the assistant engine): only these tools are
+   * offered and allowed, and execute_command only for commands known to be read-only (not even
+   * TRUSTED_COMMANDS).
+   */
+  onlyTools?: ReadonlySet<string>;
 }
 
 export interface LoopResult {
@@ -115,7 +122,8 @@ export class AgentLoop {
       await this.maybeSummarize(chatId, history);
 
       const messages: ChatMessage[] = [{ role: 'system', content: this.buildSystemPrompt() }, ...history];
-      const resp = await this.provider.chatCompletion(messages, TOOL_DEFINITIONS);
+      const tools = cb.onlyTools ? TOOL_DEFINITIONS.filter((t) => cb.onlyTools!.has(t.name)) : TOOL_DEFINITIONS;
+      const resp = await this.provider.chatCompletion(messages, tools);
 
       let toolCalls = resp.toolCalls;
       if (toolCalls.length === 0 && resp.content) {
@@ -139,6 +147,20 @@ export class AgentLoop {
           parsedArgs = JSON.parse(tc.arguments || '{}');
         } catch {
           /* keep {} */
+        }
+
+        // read-only runs: nothing outside the allowed tools, and only read-only commands
+        if (cb.onlyTools) {
+          const readOnlyCommand = tc.name !== 'execute_command' || classifyCommand(String(parsedArgs.command || '')).reason === 'read-only';
+          if (!cb.onlyTools.has(tc.name) || !readOnlyCommand) {
+            this.pushMessage(chatId, history, {
+              role: 'tool',
+              tool_call_id: tc.id,
+              name: tc.name,
+              content: JSON.stringify({ success: false, error: 'Not allowed in this read-only run: investigate and advise only.' }),
+            });
+            continue;
+          }
         }
 
         // Command policy + owner approval (src/security/Gate.ts): allow / ask / never
