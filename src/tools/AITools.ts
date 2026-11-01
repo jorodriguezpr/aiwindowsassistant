@@ -24,6 +24,7 @@ import { saveNote as saveNoteToDb } from '../db/NotesStore';
 import { classifyCommand, PolicyDecision } from '../security/CommandPolicy';
 import { sensitivePathIn } from '../security/SensitivePaths';
 import { childEnv } from '../security/SecretStore';
+import { execKillable } from '../utils/proc';
 
 const execAsync = promisify(exec);
 
@@ -34,6 +35,8 @@ export interface ToolContext {
   requestApproval: (description: string, grantKey?: string) => Promise<boolean>;
   /** Progress updates for long-running tools (e.g. Claude Code runs). */
   onProgress?: (text: string) => void;
+  /** /cancel: stop this tool call — the running command's whole process tree is killed. */
+  signal?: AbortSignal;
   /** Send a file to the user's chat (screenshots, PDF reports). */
   sendFile?: (filePath: string, kind: 'photo' | 'document', caption?: string) => Promise<void>;
 }
@@ -291,7 +294,7 @@ export class AIToolExecutor {
   private async dispatch(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     switch (name) {
       case 'execute_command':
-        return this.executeCommand(String(args.command || ''), args.cwd ? String(args.cwd) : undefined);
+        return this.executeCommand(String(args.command || ''), args.cwd ? String(args.cwd) : undefined, ctx.signal);
       case 'launch_program':
         return this.launchProgram(String(args.target || ''), args.args ? String(args.args) : undefined);
       case 'search_files':
@@ -324,7 +327,7 @@ export class AIToolExecutor {
       default:
         if (SYSADMIN_TOOL_NAMES.has(name)) return executeSysAdminTool(name, args);
         if (WINDOWS_TOOL_NAMES.has(name)) return executeWindowsTool(name, args, ctx);
-        if (UI_TOOL_NAMES.has(name)) return executeUiTool(name, args);
+        if (UI_TOOL_NAMES.has(name)) return executeUiTool(name, args, ctx.signal);
         if (name === 'run_repair') return executeRepairTool(args, ctx, (n, a) => this.dispatch(n, a, ctx));
         return { success: false, error: `Unknown tool: ${name}` };
     }
@@ -336,30 +339,17 @@ export class AIToolExecutor {
     return { success: true, output: `Saved note #${id}` };
   }
 
-  private async executeCommand(command: string, cwd?: string): Promise<ToolResult> {
+  private async executeCommand(command: string, cwd?: string, signal?: AbortSignal): Promise<ToolResult> {
     if (!command.trim()) return { success: false, error: 'Empty command' };
     const workDir = cwd && fs.existsSync(cwd) ? cwd : config.assistant.defaultCwd;
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        shell: 'powershell.exe',
-        cwd: workDir,
-        timeout: 120000,
-        maxBuffer: 1024 * 1024,
-        windowsHide: true,
-        env: childEnv({ POWERSHELL_TELEMETRY_OPTOUT: '1' }),
-      });
-      return { success: true, stdout: stdout.slice(0, 600), stderr: stderr.slice(0, 300), cwd: workDir };
-    } catch (err) {
-      const e = err as { message?: string; stdout?: string; stderr?: string; code?: number };
-      return {
-        success: false,
-        error: e.message,
-        stdout: (e.stdout || '').slice(0, 600),
-        stderr: (e.stderr || '').slice(0, 300),
-        exitCode: e.code,
-        cwd: workDir,
-      };
-    }
+    const r = await execKillable(
+      command,
+      { shell: 'powershell.exe', cwd: workDir, timeout: 120000, maxBuffer: 1024 * 1024, windowsHide: true, env: childEnv({ POWERSHELL_TELEMETRY_OPTOUT: '1' }) },
+      signal
+    );
+    if (r.cancelled) return { success: false, error: 'Cancelled by the user', stdout: r.stdout.slice(0, 600), cwd: workDir };
+    if (!r.error) return { success: true, stdout: r.stdout.slice(0, 600), stderr: r.stderr.slice(0, 300), cwd: workDir };
+    return { success: false, error: r.error.message, stdout: r.stdout.slice(0, 600), stderr: r.stderr.slice(0, 300), exitCode: r.error.code, cwd: workDir };
   }
 
   private async launchProgram(target: string, argsStr?: string): Promise<ToolResult> {
@@ -490,7 +480,9 @@ export class AIToolExecutor {
 
   private async delegateToClaudeCode(prompt: string, cwd: string | undefined, ctx: ToolContext): Promise<ToolResult> {
     if (!prompt.trim()) return { success: false, error: 'Empty prompt' };
-    const result = await ctx.claudeBridge.run(ctx.chatId, prompt, { cwd, onProgress: ctx.onProgress });
+    const stop = () => ctx.claudeBridge.cancel(ctx.chatId);
+    ctx.signal?.addEventListener('abort', stop, { once: true });
+    const result = await ctx.claudeBridge.run(ctx.chatId, prompt, { cwd, onProgress: ctx.onProgress }).finally(() => ctx.signal?.removeEventListener('abort', stop));
     if (!result.success) {
       return { success: false, error: result.error, output: result.output?.slice(0, 4000), sessionId: result.sessionId };
     }

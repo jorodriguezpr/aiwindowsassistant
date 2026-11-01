@@ -149,7 +149,8 @@ Full list with defaults: see [`.env.example`](.env.example).
 | `/apps` · `/apps search\|install\|upgrade <app>` · `/apps upgrade all` | Apps with winget: what needs updating, search, install, update (install/update ask first) |
 | `/admin` · `/admin <task> [param]` | Administrator jobs through the helper: Windows updates, BitLocker, Defender scan, restore point, restart a service, hibernation/page file, system clean-up, sfc |
 | `/clear` | Reset conversation + Claude Code session for this chat |
-| `/cancel` | Cancel the currently running task |
+| `/tasks` | What the AI is doing right now: each running task with its engine, time and current step, approvals waiting for you, queued work |
+| `/cancel` · `/cancel all` · `/cancel <n>` | Stop your running and queued work — or everything (workers too) — or one item from `/tasks`. Also by saying "cancel" / "stop" / "cancela". Stopping kills the whole process tree (Claude Code and every command it started, a running PowerShell command and its children); approvals still waiting are withdrawn. An administrator job already running in the helper finishes on its own. |
 | `/pause` / `/resume` | Stop/resume processing new messages |
 | `/remember <fact>` | Save a durable note (both engines see it) |
 | `/notes [search]` | List/search saved notes |

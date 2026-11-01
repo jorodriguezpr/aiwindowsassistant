@@ -47,7 +47,7 @@ export const HELPER_MISSING =
   (IS_PKG ? '  .\\AiWindowsAssistant.exe --install-helper' : `  cd ${config.projectRoot}; npm run install-helper`);
 
 /** Runs one ops.ts job as administrator through the helper. */
-export async function callElevated(op: string, rawParam = ''): Promise<{ ok: boolean; output?: string; error?: string }> {
+export async function callElevated(op: string, rawParam = '', signal?: AbortSignal): Promise<{ ok: boolean; output?: string; error?: string }> {
   const { def, param } = validateOp(op, rawParam);
   const st = helperState();
   if (!st.running) return { ok: false, error: HELPER_MISSING };
@@ -60,6 +60,7 @@ export async function callElevated(op: string, rawParam = ''): Promise<{ ok: boo
   const answer = path.join(queueDir(), 'responses', `${id}.json`);
   const deadline = Date.now() + def.timeoutMs + 60_000;
   while (Date.now() < deadline) {
+    if (signal?.aborted) return { ok: false, error: 'Cancelled — the administrator job itself keeps running in the helper until it finishes' };
     await new Promise((r) => setTimeout(r, 700));
     if (fs.existsSync(answer)) {
       const out = JSON.parse(fs.readFileSync(answer, 'utf8'));

@@ -132,10 +132,14 @@ export async function executeRepairTool(args: Record<string, unknown>, ctx: Tool
     ctx.onProgress?.(log.join('\n'));
   };
   if (r.restorePoint) {
-    const rp = await callElevated('restore_point');
+    const rp = await callElevated('restore_point', '', ctx.signal);
     say(rp.ok ? `✅ 0. ${rp.output}` : `⚠️ 0. No restore point (${rp.error}) — continuing`);
   }
   for (const [i, step] of r.steps.entries()) {
+    if (ctx.signal?.aborted) {
+      say(`🛑 Cancelled before step ${i + 1}.${r.restorePoint ? ' A restore point was taken before the changes.' : ''}`);
+      return { success: false, error: log.join('\n') };
+    }
     const res = await exec(step.tool, step.args);
     const detail = String(res.output ?? res.stdout ?? res.error ?? '').trim().split(/\r?\n/).slice(0, 12).join('\n');
     say(`${res.success ? '✅' : '❌'} ${i + 1}. ${step.label}${detail ? `\n${detail}` : ''}`);

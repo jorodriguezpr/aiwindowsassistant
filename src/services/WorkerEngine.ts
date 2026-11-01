@@ -41,11 +41,14 @@ const TEXT_SYSTEM =
 
 export async function runOnEngine(
   engine: Engine,
-  opts: { chatId: number; prompt: string; mode: 'text' | 'readonly'; cwd?: string; claudeBridge: ClaudeCodeBridge; hookSettingsPath: string; logger?: Logger }
+  opts: { chatId: number; prompt: string; mode: 'text' | 'readonly'; cwd?: string; claudeBridge: ClaudeCodeBridge; hookSettingsPath: string; logger?: Logger; signal?: AbortSignal }
 ): Promise<WorkerResult> {
   const started = Date.now();
   if (engine === 'claude') {
-    const r = await opts.claudeBridge.run(opts.chatId, opts.prompt, { cwd: opts.cwd, hookSettingsPath: opts.hookSettingsPath });
+    const stop = () => opts.claudeBridge.cancel(opts.chatId);
+    opts.signal?.addEventListener('abort', stop, { once: true });
+    const r = await opts.claudeBridge.run(opts.chatId, opts.prompt, { cwd: opts.cwd, hookSettingsPath: opts.hookSettingsPath }).finally(() => opts.signal?.removeEventListener('abort', stop));
+    if (opts.signal?.aborted) return { success: false, output: r.output, error: 'cancelled by the owner', durationMs: r.durationMs };
     return { success: r.success, output: r.output, error: r.error, durationMs: r.durationMs, sessionId: r.sessionId };
   }
   try {
@@ -54,7 +57,7 @@ export async function runOnEngine(
       const resp = await provider.chatCompletion([
         { role: 'system', content: TEXT_SYSTEM },
         { role: 'user', content: opts.prompt },
-      ]);
+      ], undefined, opts.signal);
       const out = (resp.content || '').trim();
       return { success: !!out, output: out, error: out ? undefined : 'empty answer from the model', durationMs: Date.now() - started };
     }
@@ -64,11 +67,13 @@ export async function runOnEngine(
       opts.chatId,
       `${opts.prompt}${where}\n\nThis is a read-only investigation: look, don't change anything; end with your findings and recommendations.`,
       { chatId: opts.chatId, claudeBridge: opts.claudeBridge },
-      { sendProgress: async () => undefined, requestApproval: async () => false, onlyTools: READ_ONLY_TOOLS }
+      { sendProgress: async () => undefined, requestApproval: async () => false, onlyTools: READ_ONLY_TOOLS, signal: opts.signal }
     );
     loop.clear(opts.chatId);
+    if (opts.signal?.aborted) return { success: false, output: '', error: 'cancelled by the owner', durationMs: Date.now() - started };
     return { success: !r.awaitingContinuation, output: r.response, error: r.awaitingContinuation ? 'stopped at the step limit' : undefined, durationMs: Date.now() - started };
   } catch (err) {
+    if (opts.signal?.aborted) return { success: false, output: '', error: 'cancelled by the owner', durationMs: Date.now() - started };
     return { success: false, output: '', error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - started };
   }
 }

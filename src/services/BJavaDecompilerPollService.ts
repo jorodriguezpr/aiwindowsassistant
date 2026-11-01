@@ -28,6 +28,7 @@ import type { TelegramGateway } from '../gateways/TelegramGateway';
 import { hookCommand } from '../utils/launcher';
 import { getEngine, engineLabel } from './EngineSettings';
 import { runOnEngine } from './WorkerEngine';
+import { startJob, endJob, Job } from '../core/Activity';
 import type { Logger } from '../logger';
 
 interface PendingDelegation {
@@ -108,9 +109,11 @@ export class BJavaDecompilerPollService {
     }
 
     const started = Date.now();
+    let job: Job | undefined;
     try {
       // Claude Code (default) or, when turned on, the assistant engine (WORKER_ENGINE / /workers)
       const engine = getEngine('workers');
+      job = startJob(syntheticChatId(delegation.id), 'worker', engineLabel(engine), `BJavaDecompiler delegation ${delegation.id}`);
       const result = await runOnEngine(engine, {
         chatId: syntheticChatId(delegation.id),
         prompt: delegation.prompt,
@@ -118,6 +121,7 @@ export class BJavaDecompilerPollService {
         claudeBridge: this.claudeBridge,
         hookSettingsPath: this.ensureHookSettings(),
         logger: this.logger,
+        signal: job.controller.signal,
       });
       await this.submitResult(delegation.id, {
         status: result.success ? 'completed' : 'failed',
@@ -135,6 +139,8 @@ export class BJavaDecompilerPollService {
         status: 'failed', errorMessage: message, durationMs: Date.now() - started,
       }).catch(() => undefined);
       await this.gateway.notifyOwner(`❌ BJavaDecompiler AI delegation errored (${delegation.id}): ${message}`).catch(() => undefined);
+    } finally {
+      endJob(job);
     }
   }
 

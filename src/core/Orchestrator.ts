@@ -5,6 +5,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { addQueued, removeQueued } from './Activity';
 
 interface QueueEntry {
   chatId: number;
@@ -23,9 +24,15 @@ export class Orchestrator extends EventEmitter {
   private maxConcurrent = 3;
 
   /** Submit work; serialized per chat, bounded concurrency across chats. */
-  submit(chatId: number, run: () => Promise<void>): Promise<void> {
+  submit(chatId: number, run: () => Promise<void>, label = 'task'): Promise<void> {
+    // listed by /tasks while waiting; /cancel drops it before it starts (Activity.ts)
+    const q = addQueued(chatId, label);
+    const guarded = async () => {
+      removeQueued(q);
+      if (!q.cancelled) await run();
+    };
     const prev = this.perChat.get(chatId) || Promise.resolve();
-    const next = prev.catch(() => undefined).then(() => this.acquireAndRun(chatId, run));
+    const next = prev.catch(() => undefined).then(() => this.acquireAndRun(chatId, guarded));
     this.perChat.set(chatId, next);
     next.finally(() => {
       if (this.perChat.get(chatId) === next) this.perChat.delete(chatId);

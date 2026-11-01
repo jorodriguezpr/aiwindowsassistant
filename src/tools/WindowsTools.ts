@@ -17,6 +17,7 @@ import * as path from 'path';
 import type { ToolDefinition } from '../providers/AIProvider';
 import type { ToolResult, ToolContext } from './AITools';
 import { childEnv } from '../security/SecretStore';
+import { execFileKillable } from '../utils/proc';
 import { callElevated, helperState, HELPER_MISSING } from '../elevated/client';
 import { ELEVATED_OPS } from '../elevated/ops';
 import { analyzeDiskSpace, cleanUpDisk, CLEANUP_TARGETS } from '../services/CleanupService';
@@ -117,12 +118,10 @@ function cleanWinget(s: string): string {
     .slice(0, 3500);
 }
 
-export function winget(args: string[], timeoutMs = 120000): Promise<{ ok: boolean; out: string }> {
-  return new Promise((resolve) => {
-    execFile('winget', [...args, '--accept-source-agreements', '--disable-interactivity'], { env: childEnv(), windowsHide: true, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) =>
-      resolve({ ok: !err, out: cleanWinget(`${stdout || ''}${stderr ? '\n' + stderr : ''}`) || (err ? err.message : '') })
-    );
-  });
+export async function winget(args: string[], timeoutMs = 120000, signal?: AbortSignal): Promise<{ ok: boolean; out: string }> {
+  const r = await execFileKillable('winget', [...args, '--accept-source-agreements', '--disable-interactivity'], { env: childEnv(), windowsHide: true, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, signal);
+  if (r.cancelled) return { ok: false, out: 'Cancelled by the user' };
+  return { ok: !r.error, out: cleanWinget(`${r.stdout}${r.stderr ? '\n' + r.stderr : ''}`) || (r.error ? r.error.message : '') };
 }
 
 /** "vlc" → the package id winget would install, or the list to choose from. */
@@ -137,24 +136,24 @@ async function resolvePackage(query: string): Promise<{ id?: string; list?: stri
   return { list: r.out || `Nothing found for "${query}"` };
 }
 
-async function appsInstall(query: string, upgrade: boolean): Promise<ToolResult> {
+async function appsInstall(query: string, upgrade: boolean, signal?: AbortSignal): Promise<ToolResult> {
   const q = query.trim();
   if (!q) return { success: false, error: 'Which app?' };
   if (upgrade && q.toLowerCase() === 'all') {
     if (helperState().running) {
-      const r = await callElevated('winget_upgrade', 'all');
+      const r = await callElevated('winget_upgrade', 'all', signal);
       return { success: r.ok, output: r.output, error: r.error };
     }
-    const r = await winget(['upgrade', '--all', '--silent', '--accept-package-agreements'], 2 * 3600_000);
+    const r = await winget(['upgrade', '--all', '--silent', '--accept-package-agreements'], 2 * 3600_000, signal);
     return { success: r.ok, output: r.out, error: r.ok ? undefined : `${r.out}\n(Some apps need administrator rights: ${HELPER_MISSING})` };
   }
   const pkg = await resolvePackage(q);
   if (!pkg.id) return { success: false, error: `Several or no matches — say which one by its id:\n${pkg.list}` };
   if (helperState().running) {
-    const r = await callElevated(upgrade ? 'winget_upgrade' : 'winget_install', pkg.id);
+    const r = await callElevated(upgrade ? 'winget_upgrade' : 'winget_install', pkg.id, signal);
     return { success: r.ok, output: `${pkg.id}: ${r.output || ''}`, error: r.error };
   }
-  const r = await winget([upgrade ? 'upgrade' : 'install', '--id', pkg.id, '--exact', '--silent', '--accept-package-agreements'], 3600_000);
+  const r = await winget([upgrade ? 'upgrade' : 'install', '--id', pkg.id, '--exact', '--silent', '--accept-package-agreements'], 3600_000, signal);
   return { success: r.ok, output: `${pkg.id}:\n${r.out}`, error: r.ok ? undefined : `${pkg.id}: ${r.out}` };
 }
 
@@ -238,11 +237,11 @@ export async function executeWindowsTool(name: string, args: Record<string, unkn
         return { success: true, output: r.out };
       }
       case 'apps_install':
-        return await appsInstall(s('app'), false);
+        return await appsInstall(s('app'), false, ctx.signal);
       case 'apps_upgrade':
-        return await appsInstall(s('app'), true);
+        return await appsInstall(s('app'), true, ctx.signal);
       case 'admin_task': {
-        const r = await callElevated(s('task'), s('param'));
+        const r = await callElevated(s('task'), s('param'), ctx.signal);
         return { success: r.ok, output: r.output, error: r.error };
       }
       case 'analyze_disk_space':

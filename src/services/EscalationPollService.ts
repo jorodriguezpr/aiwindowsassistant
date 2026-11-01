@@ -32,6 +32,7 @@ import type { TelegramGateway } from '../gateways/TelegramGateway';
 import { hookCommand } from '../utils/launcher';
 import { getEngine, engineLabel } from './EngineSettings';
 import { runOnEngine } from './WorkerEngine';
+import { startJob, endJob, Job } from '../core/Activity';
 import type { Logger } from '../logger';
 
 interface PendingEscalation {
@@ -166,9 +167,11 @@ export class EscalationPollService {
     }
 
     const started = Date.now();
+    let job: Job | undefined;
     try {
       // Claude Code (default) or, when turned on, the assistant engine — read-only either way
       const engine = getEngine('workers');
+      job = startJob(syntheticChatId(escalation.id), 'worker', engineLabel(engine), `Fleet escalation ${escalation.id}`);
       const result = await runOnEngine(engine, {
         chatId: syntheticChatId(escalation.id),
         prompt: escalation.prompt,
@@ -177,6 +180,7 @@ export class EscalationPollService {
         claudeBridge: this.claudeBridge,
         hookSettingsPath: this.ensureHookSettings(),
         logger: this.logger,
+        signal: job.controller.signal,
       });
       await this.submitResult(escalation.id, {
         status: result.success ? 'completed' : 'failed',
@@ -205,7 +209,9 @@ export class EscalationPollService {
       await this.submitResult(escalation.id, {
         status: 'failed', errorMessage: message, durationMs: Date.now() - started,
       }).catch(() => undefined);
-      await this.gateway.notifyOwner(`❌ Claude Code escalation errored — ${extractSubject(escalation)}: ${message}`).catch(() => undefined);
+      await this.gateway.notifyOwner(`❌ Escalation errored — ${extractSubject(escalation)}: ${message}`).catch(() => undefined);
+    } finally {
+      endJob(job);
     }
   }
 

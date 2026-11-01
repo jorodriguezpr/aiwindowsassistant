@@ -26,6 +26,8 @@ export interface LoopCallbacks {
    * TRUSTED_COMMANDS).
    */
   onlyTools?: ReadonlySet<string>;
+  /** /cancel: stop between steps; the request in flight and the running command are aborted too. */
+  signal?: AbortSignal;
 }
 
 export interface LoopResult {
@@ -118,12 +120,24 @@ export class AgentLoop {
     const maxIter = config.assistant.maxIterations;
     let finalText = '';
 
+    const cancelled = (): LoopResult => {
+      this.pushMessage(chatId, history, { role: 'assistant', content: '(The user cancelled this task.)' });
+      chatState.finishPendingTask(pendingId, 'failed');
+      return { response: '🛑 Cancelled.', awaitingContinuation: false };
+    };
     for (let iter = 0; iter < maxIter; iter++) {
+      if (cb.signal?.aborted) return cancelled();
       await this.maybeSummarize(chatId, history);
 
       const messages: ChatMessage[] = [{ role: 'system', content: this.buildSystemPrompt() }, ...history];
       const tools = cb.onlyTools ? TOOL_DEFINITIONS.filter((t) => cb.onlyTools!.has(t.name)) : TOOL_DEFINITIONS;
-      const resp = await this.provider.chatCompletion(messages, tools);
+      let resp;
+      try {
+        resp = await this.provider.chatCompletion(messages, tools, cb.signal);
+      } catch (err) {
+        if (cb.signal?.aborted) return cancelled();
+        throw err;
+      }
 
       let toolCalls = resp.toolCalls;
       if (toolCalls.length === 0 && resp.content) {
@@ -142,6 +156,7 @@ export class AgentLoop {
       this.pushMessage(chatId, history, { role: 'assistant', content: resp.content || '', tool_calls: toolCalls });
 
       for (const tc of toolCalls) {
+        if (cb.signal?.aborted) return cancelled();
         let parsedArgs: Record<string, unknown> = {};
         try {
           parsedArgs = JSON.parse(tc.arguments || '{}');
@@ -183,6 +198,7 @@ export class AgentLoop {
           requestApproval: cb.requestApproval,
           onProgress: cb.onToolProgress,
           sendFile: ctx.sendFile,
+          signal: cb.signal,
         });
         this.pushMessage(chatId, history, {
           role: 'tool',

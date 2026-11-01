@@ -15,7 +15,7 @@
  * always asks (unsaved work).
  */
 
-import { execFile } from 'child_process';
+import { execFileKillable } from '../utils/proc';
 import type { ToolDefinition } from '../providers/AIProvider';
 import type { ToolResult } from './AITools';
 import { childEnv } from '../security/SecretStore';
@@ -160,19 +160,19 @@ switch ($p.action) {
   default { throw "Unknown UI action '$($p.action)'" }
 }`;
 
-function ui(params: Record<string, unknown>, timeoutMs = 45000): Promise<ToolResult> {
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', PS_UI],
-      { env: childEnv({ AIWA_UI: Buffer.from(JSON.stringify(params), 'utf8').toString('base64') }), windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        const out = String(stdout || '').trim();
-        if (err) resolve({ success: false, error: (String(stderr || '').trim().split(/\r?\n/).find((l) => l.trim() && !/^At line|^\+|CategoryInfo|FullyQualifiedErrorId/.test(l)) || err.message).slice(0, 500) });
-        else resolve({ success: true, output: out.slice(0, 12000) || 'Done.' });
-      }
-    );
-  });
+let uiSignal: AbortSignal | undefined;
+
+async function ui(params: Record<string, unknown>, timeoutMs = 45000): Promise<ToolResult> {
+  const r = await execFileKillable(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', PS_UI],
+    { env: childEnv({ AIWA_UI: Buffer.from(JSON.stringify(params), 'utf8').toString('base64') }), windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+    uiSignal
+  );
+  if (r.cancelled) return { success: false, error: 'Cancelled by the user' };
+  const out = r.stdout.trim();
+  if (r.error) return { success: false, error: (r.stderr.trim().split(/\r?\n/).find((l) => l.trim() && !/^At line|^\+|CategoryInfo|FullyQualifiedErrorId/.test(l)) || r.error.message).slice(0, 500) };
+  return { success: true, output: out.slice(0, 12000) || 'Done.' };
 }
 
 export const UI_TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -222,8 +222,9 @@ export const UI_TOOL_DEFINITIONS: ToolDefinition[] = [
 
 export const UI_TOOL_NAMES = new Set(UI_TOOL_DEFINITIONS.map((d) => d.name));
 
-export async function executeUiTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+export async function executeUiTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
   const s = (k: string) => String(args[k] ?? '');
+  uiSignal = signal;
   switch (name) {
     case 'ui_list_windows':
       return ui({ action: 'list' });

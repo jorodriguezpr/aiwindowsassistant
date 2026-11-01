@@ -84,13 +84,14 @@ export class AIProvider {
     return `${this.provider} / ${this.model}`;
   }
 
-  async chatCompletion(messages: ChatMessage[], tools?: ToolDefinition[]): Promise<ChatResponse> {
+  /** `signal`: /cancel aborts the request in flight. */
+  async chatCompletion(messages: ChatMessage[], tools?: ToolDefinition[], signal?: AbortSignal): Promise<ChatResponse> {
     const started = Date.now();
     let response: ChatResponse;
     if (this.provider === 'anthropic') {
-      response = await this.anthropicChat(messages, tools);
+      response = await this.anthropicChat(messages, tools, signal);
     } else {
-      response = await this.openAiCompatibleChat(messages, tools);
+      response = await this.openAiCompatibleChat(messages, tools, signal);
     }
     if (response.usage) {
       // Fire-and-forget — logging failure must not fail the request
@@ -114,7 +115,7 @@ export class AIProvider {
 
   // ---------- Anthropic ----------
 
-  private async anthropicChat(messages: ChatMessage[], tools?: ToolDefinition[]): Promise<ChatResponse> {
+  private async anthropicChat(messages: ChatMessage[], tools?: ToolDefinition[], signal?: AbortSignal): Promise<ChatResponse> {
     const systemParts = messages.filter((m) => m.role === 'system').map((m) => m.content);
     const nonSystem = messages.filter((m) => m.role !== 'system');
 
@@ -162,6 +163,7 @@ export class AIProvider {
     }
 
     const resp = await this.http.post('https://api.anthropic.com/v1/messages', body, {
+      signal,
       headers: {
         'x-api-key': config.ai.anthropicApiKey,
         'anthropic-version': '2023-06-01',
@@ -192,7 +194,7 @@ export class AIProvider {
 
   // ---------- Ollama Cloud / local Ollama (OpenAI-compatible) ----------
 
-  private async openAiCompatibleChat(messages: ChatMessage[], tools?: ToolDefinition[]): Promise<ChatResponse> {
+  private async openAiCompatibleChat(messages: ChatMessage[], tools?: ToolDefinition[], signal?: AbortSignal): Promise<ChatResponse> {
     const isCloud = this.provider === 'ollama-cloud';
     const baseUrl = isCloud ? config.ai.ollamaCloudBaseUrl : config.ai.ollamaBaseUrl;
     const apiKey = isCloud ? config.ai.ollamaCloudApiKey : undefined;
@@ -232,7 +234,7 @@ export class AIProvider {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
-    const resp = await this.http.post(`${baseUrl}/v1/chat/completions`, body, { headers });
+    const resp = await this.http.post(`${baseUrl}/v1/chat/completions`, body, { headers, signal });
 
     const msg = resp.data.choices?.[0]?.message || {};
     const toolCalls: ToolCall[] = (msg.tool_calls || []).map(

@@ -17,6 +17,7 @@ import { AIToolExecutor } from '../tools/AITools';
 import { gateToolCall, grant } from '../security/Gate';
 import { MCP_TOOL_NAMES } from '../mcp/McpServer';
 import { listRoutines } from '../services/RepairService';
+import { startJob, stepJob, endJob, cancelWork, runningJobs, queuedWork, ago, Job } from '../core/Activity';
 import { getEngine, setEngine, parseEngine, engineLabel } from '../services/EngineSettings';
 import type { WebChat } from './WebChat';
 import type { AlertService } from '../services/AlertService';
@@ -37,6 +38,11 @@ import { helperState, HELPER_MISSING } from '../elevated/client';
 import { ELEVATED_OPS } from '../elevated/ops';
 import type { ApprovalHookServer } from '../tools/ApprovalHookServer';
 import type { Logger } from '../logger';
+
+/** The last non-empty line of a progress text (what is happening now). */
+function lastLine(t: string): string {
+  return String(t || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
+}
 
 /** Splits off the first N whitespace-separated tokens, preserving the untouched remainder
  * (needed for /schedule add, whose trailing prompt argument is free text). */
@@ -93,7 +99,8 @@ const HELP_TEXT = `*AiWindowsAssistant* — delegate tasks from your phone 🤖
 
 At the PC: Ctrl+Alt+Space opens a chat window with this same conversation.
 /clear — Reset conversation + Claude Code session
-/cancel — Cancel the running task
+/tasks — What the AI is doing right now (running, waiting for approval, queued)
+/cancel — Stop your running and queued work · /cancel all — everything, workers too · /cancel <n> — one item (or just say "cancel" / "stop")
 /pause, /resume — Pause/resume the bot
 /remember <fact> — Save a durable note (both engines see it)
 /notes [search] — List/search saved notes
@@ -228,7 +235,7 @@ export class TelegramGateway {
           `• Local model: ${this.provider.getInfo()}\n` +
           `• Claude Code CLI: ${claudePath ? '✅ ' + claudePath : '❌ not found'}\n` +
           `• Claude session (this chat): ${this.claudeBridge.hasSession(ctx.chat.id) ? 'active' : 'none'}\n` +
-          `• Queue: ${this.orchestrator.getActiveCount()} active, ${this.orchestrator.getQueuedCount()} queued\n` +
+          `• Now: ${runningJobs().length} running, ${queuedWork().length} queued — /tasks shows what, /cancel stops it\n` +
           `• Uptime: ${uptime} min\n` +
           `• Tokens logged: ${usage.total.toLocaleString()} (${usage.entries} calls)\n` +
           `• Autostart: ${isAutostartEnabled() ? 'enabled' : 'disabled'}${apiKeyLeak}`,
@@ -274,12 +281,12 @@ export class TelegramGateway {
     this.bot.command('claude', async (ctx) => {
       const prompt = this.commandArgs(ctx);
       if (!prompt) return ctx.reply('Usage: /claude <prompt for Claude Code>');
-      void this.orchestrator.submit(ctx.chat.id, () => this.runClaudeTask(ctx.chat.id, prompt));
+      void this.orchestrator.submit(ctx.chat.id, () => this.runClaudeTask(ctx.chat.id, prompt), prompt);
     });
 
     // ---------- Windows 11 (1.4.0) — all through runToolDirect, so the policy + approval apply ----------
     const tool = (ctx: Context, name: string, args: Record<string, unknown>, description: string) =>
-      void this.orchestrator.submit(ctx.chat!.id, () => this.runToolDirect(ctx.chat!.id, name, args, description));
+      void this.orchestrator.submit(ctx.chat!.id, () => this.runToolDirect(ctx.chat!.id, name, args, description), description);
 
     this.bot.command('screenshot', (ctx) => tool(ctx, 'take_screenshot', {}, 'Screenshot'));
 
@@ -391,10 +398,8 @@ export class TelegramGateway {
       await ctx.reply('🧹 Conversation and Claude Code session cleared. What task would you like to delegate?');
     });
 
-    this.bot.command('cancel', async (ctx) => {
-      const killed = this.claudeBridge.cancel(ctx.chat.id);
-      await ctx.reply(killed ? '🛑 Claude Code task cancelled.' : 'Nothing running for this chat.');
-    });
+    this.bot.command('cancel', (ctx) => this.cancelCommand(ctx.chat.id, this.commandArgs(ctx)));
+    this.bot.command('tasks', (ctx) => ctx.reply(this.tasksText()));
 
     this.bot.command('pause', async (ctx) => {
       this.setPaused(true);
@@ -561,6 +566,11 @@ export class TelegramGateway {
       }
     }
 
+    // "cancel" / "stop" / "cancela todo" — at once, not queued behind the work it should stop
+    const stopWords = /^(cancel|cancela|cancelar|stop|para|detente|alto|abort|abortar)(\s+(all|everything|todo|todos|todo lo que haces))?[\s.!]*$/i.exec(text.trim());
+    if (stopWords) return this.cancelCommand(chatId, stopWords[2] ? 'all' : '');
+
+    let job: Job | undefined;
     void this.orchestrator.submit(chatId, async () => {
       await this.sendTyping(chatId);
       try {
@@ -582,6 +592,8 @@ export class TelegramGateway {
         // Local AgentLoop (Ollama/Anthropic provider, tool-calling loop)
         await this.sendProgress(chatId, '🧠 Thinking…');
         const started = Date.now();
+        job = startJob(chatId, 'task', engineLabel('assistant'), text);
+        const signal = job.controller.signal;
         const result = await this.loop.run(
           chatId,
           text,
@@ -592,9 +604,10 @@ export class TelegramGateway {
             sendFile: (f, kind, caption) => this.sendFile(chatId, f, kind, caption),
           },
           {
-            sendProgress: (t) => this.sendProgressThrottled(chatId, t),
+            sendProgress: (t) => (stepJob(job, t), this.sendProgressThrottled(chatId, t)),
             requestApproval: (desc, key) => this.requestApproval(chatId, desc, key),
-            onToolProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+            onToolProgress: (t) => (stepJob(job, lastLine(t)), void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`)),
+            signal,
           }
         );
         await this.clearProgress(chatId);
@@ -605,35 +618,43 @@ export class TelegramGateway {
         const msg = err instanceof Error ? err.message : String(err);
         this.logger?.error({ err }, 'task failed');
         await this.sendLong(chatId, `❌ Error: ${msg}`);
+      } finally {
+        endJob(job);
       }
-    });
+    }, text);
   }
 
   /** Direct single-tool execution (used by /execute and the local fast path). */
   private async runToolDirect(chatId: number, tool: string, args: Record<string, unknown>, description: string): Promise<void> {
     const pendingId = chatState.startPendingTask(chatId, description);
     let ok = false;
+    const job = startJob(chatId, 'task', 'tool', description);
+    stepJob(job, description);
     try {
       const gate = await gateToolCall(chatId, tool, args, description, (d, key) => this.requestApproval(chatId, d, key));
       if (!gate.ok) {
-        await this.bot.telegram.sendMessage(chatId, gate.blocked ? `⛔ ${gate.error}\n${description}` : '❌ Denied.');
+        if (!job.controller.signal.aborted) await this.bot.telegram.sendMessage(chatId, gate.blocked ? `⛔ ${gate.error}\n${description}` : '❌ Denied.');
         return;
       }
+      if (job.controller.signal.aborted) return;
       await this.sendTyping(chatId);
       const result = await this.executor.execute(tool, JSON.stringify(args), {
         chatId,
         claudeBridge: this.claudeBridge,
         requestApproval: (d) => this.requestApproval(chatId, d),
-        onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+        onProgress: (t) => (stepJob(job, lastLine(t)), void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`)),
         sendFile: (f, kind, caption) => this.sendFile(chatId, f, kind, caption),
+        signal: job.controller.signal,
       });
       ok = result.success;
+      if (job.controller.signal.aborted) return; // /cancel already answered
       const out = result.success
         ? `✅ ${description}\n${String(result.output ?? result.stdout ?? 'Done.')}`
         : `❌ ${description}\n${result.error || 'Failed'}${result.stderr ? '\n' + result.stderr : ''}`;
       await this.sendLong(chatId, out);
       await this.bot.telegram.sendMessage(chatId, 'What task would you like to delegate next?');
     } finally {
+      endJob(job);
       chatState.finishPendingTask(pendingId, ok ? 'done' : 'failed');
     }
   }
@@ -649,13 +670,17 @@ export class TelegramGateway {
     const pendingId = chatState.startPendingTask(chatId, label);
     let ok = false;
     const started = Date.now();
+    const job = startJob(chatId, 'task', 'Claude Code', label);
+    const stop = () => this.claudeBridge.cancel(chatId);
+    job.controller.signal.addEventListener('abort', stop, { once: true });
     try {
       await this.sendTyping(chatId);
       await this.sendProgress(chatId, '🤖 Claude Code is working…');
       const result = await this.claudeBridge.run(chatId, prompt, {
-        onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+        onProgress: (t) => (stepJob(job, lastLine(t)), void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`)),
       });
       await this.clearProgress(chatId);
+      if (job.controller.signal.aborted) return; // /cancel already answered
       ok = result.success;
       this.toastIfLong(started, label, result.success ? result.output : `Failed: ${result.error}`);
       if (result.success) {
@@ -665,8 +690,53 @@ export class TelegramGateway {
       }
       await this.bot.telegram.sendMessage(chatId, 'Anything else to delegate?');
     } finally {
+      job.controller.signal.removeEventListener('abort', stop);
+      endJob(job);
       chatState.finishPendingTask(pendingId, ok ? 'done' : 'failed');
     }
+  }
+
+  /** /cancel, /cancel all, /cancel <n>, or "cancel" / "stop" / "cancela todo" in words. */
+  private async cancelCommand(chatId: number, arg: string): Promise<unknown> {
+    const a = arg.trim().toLowerCase();
+    const target: number | 'all' | { id: number } = a === 'all' || a === 'todo' ? 'all' : /^#?\d+$/.test(a) ? { id: Number(a.replace('#', '')) } : chatId;
+    const r = cancelWork(target);
+    // approvals still waiting for an answer: withdrawn (count as denied)
+    let approvals = 0;
+    if (typeof target !== 'object') {
+      for (const [id, p] of [...this.pendingApprovals]) {
+        if (target === 'all' || p.chatId === chatId) {
+          this.settleApproval(id, false, 'error');
+          approvals++;
+        }
+      }
+    }
+    // a Claude Code process this chat started outside a tracked job (safety net)
+    if (typeof target === 'number') this.claudeBridge.cancel(chatId);
+    if (target === 'all') this.claudeBridge.cancelAll();
+    if (typeof target !== 'object' && this.loop.isParked(chatId)) this.loop.clear(chatId);
+    await this.clearProgress(chatId);
+    const lines = [
+      ...r.jobs.map((j) => `🛑 Stopped #${j.id} ${j.engine} — ${j.label} (ran ${ago(Date.now() - j.startedAt)})`),
+      ...r.queued.map((q) => `🗑 Removed from the queue #${q.id} — ${q.label}`),
+      ...(approvals ? [`❌ ${approvals} approval request(s) withdrawn`] : []),
+    ];
+    if (!lines.length) return this.bot.telegram.sendMessage(chatId, typeof target === 'object' ? `No running or queued item #${target.id}. /tasks shows the list.` : '😴 Nothing is running.');
+    return this.bot.telegram.sendMessage(chatId, lines.join('\n'));
+  }
+
+  /** /tasks: what the AI is doing right now, and what waits. */
+  private tasksText(): string {
+    const now = Date.now();
+    const owner = (id: number) => this.isAllowed(id);
+    const running = runningJobs().map((j) => {
+      const who = j.kind === 'worker' ? '⚙️ worker' : owner(j.chatId) ? '▶' : `▶ (chat ${j.chatId})`;
+      return `${who} #${j.id} · ${j.engine} · ${ago(now - j.startedAt)}\n   ${j.label}${j.step && j.step !== j.label ? `\n   now: ${j.step} (${ago(now - j.stepAt)} ago)` : ''}`;
+    });
+    const approvals = [...this.pendingApprovals.values()].map((p) => `✋ Waiting for your approval: ${p.description.replace(/[*_\`]/g, '').split('\n').find((l) => l.trim() && !/approval required/i.test(l)) || ''}`);
+    const queued = queuedWork().map((q) => `🕒 queued #${q.id} · ${ago(now - q.queuedAt)} — ${q.label}`);
+    if (!running.length && !approvals.length && !queued.length) return '😴 Idle — nothing is running or waiting.';
+    return [`🧭 What the AI is doing (${running.length} running, ${queued.length} queued)`, '', ...running, ...approvals, ...queued, '', 'Stop: /cancel (yours) · /cancel all · /cancel <number>'].join('\n');
   }
 
   /** Screenshots and reports: photo when small enough, otherwise as a file. */
@@ -704,7 +774,7 @@ export class TelegramGateway {
       } finally {
         fs.rmSync(file, { force: true });
       }
-    });
+    }, '📷 picture');
   }
 
   // ---------- approvals ----------
@@ -861,7 +931,8 @@ export class TelegramGateway {
       { command: 'fix', description: 'Repair routines' },
       { command: 'alerts', description: 'Proactive alerts' },
       { command: 'clear', description: 'Reset conversation' },
-      { command: 'cancel', description: 'Cancel running task' },
+      { command: 'tasks', description: 'What the AI is doing now' },
+      { command: 'cancel', description: 'Stop running work (/cancel all)' },
       { command: 'pause', description: 'Pause bot' },
       { command: 'resume', description: 'Resume bot' },
       { command: 'help', description: 'Help' },

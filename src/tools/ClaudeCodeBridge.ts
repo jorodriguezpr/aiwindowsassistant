@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import { config } from '../config';
 import { childEnv } from '../security/SecretStore';
 import { selfCommand, hookCommand } from '../utils/launcher';
+import { killTree } from '../utils/proc';
 import * as chatState from '../db/ChatStateStore';
 import type { Logger } from '../logger';
 
@@ -269,11 +270,19 @@ export class ClaudeCodeBridge {
   cancel(chatId: number): boolean {
     const proc = this.running.get(chatId);
     if (proc) {
-      proc.kill('SIGTERM');
+      // the whole tree: claude.exe and every Bash/PowerShell/tool process it started
+      killTree(proc.pid);
       this.running.delete(chatId);
       return true;
     }
     return false;
+  }
+
+  /** /cancel all: every Claude Code run (chats and workers), with their process trees. */
+  cancelAll(): number {
+    const ids = [...this.running.keys()];
+    for (const id of ids) this.cancel(id);
+    return ids.length;
   }
 
   isRunning(chatId: number): boolean {
