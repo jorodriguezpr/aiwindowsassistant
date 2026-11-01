@@ -24,9 +24,11 @@ import { ApprovalHookServer } from './tools/ApprovalHookServer';
 import { AgentLoop } from './core/AgentLoop';
 import { AIProvider } from './providers/AIProvider';
 import { AIToolExecutor } from './tools/AITools';
+import { buildHealthReport, HEALTH_PROMPT } from './services/HealthCheckService';
+import { gateToolCall } from './security/Gate';
+import { MCP_TOOL_NAMES } from './mcp/McpServer';
 
-async function main(): Promise<void> {
-  const id = Number(process.argv[2]);
+async function main(id: number): Promise<void> {
   if (!Number.isFinite(id)) {
     console.error('Usage: scheduled-runner.js <taskId>');
     process.exit(1);
@@ -41,13 +43,33 @@ async function main(): Promise<void> {
 
   const bot = new Telegraf(config.telegram.token);
 
+  // /health weekly: no AI, just the read-only health report as a PDF
+  if (task.prompt === HEALTH_PROMPT) {
+    try {
+      const rep = await buildHealthReport();
+      await bot.telegram.sendDocument(task.chatId, { source: rep.pdfPath }, { caption: `⏰ ${task.name}\n${rep.summary}`.slice(0, 1000) });
+    } catch (err) {
+      await bot.telegram.sendMessage(task.chatId, `⏰ ${task.name} failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
+    }
+    markScheduledTaskRun(id);
+    process.exit(0);
+  }
+
   // Shared, always-deny approval gate for the whole run — used both for a direct Claude Code
   // engine run and for the Ollama engine's own ClaudeCodeBridge instance (in case the model
   // decides to call delegate_to_claude_code as a sub-tool).
   const claudeBridge = new ClaudeCodeBridge();
   const approvalServer = new ApprovalHookServer(async () => false);
   try {
-    claudeBridge.setApprovalHookPort(await approvalServer.start());
+    claudeBridge.setApprovalHook(await approvalServer.start(), approvalServer.token);
+    // Claude Code's MCP tool calls: read-only ones run, anything needing approval is denied (nobody is there)
+    const executor = new AIToolExecutor();
+    approvalServer.toolRunner = async (chatId, name, args) => {
+      if (!MCP_TOOL_NAMES.has(name)) return { success: false, error: `tool ${name} is not available` };
+      const gate = await gateToolCall(chatId, name, args, name, async () => false);
+      if (!gate.ok) return { success: false, error: `${gate.error} (unattended scheduled run)` };
+      return executor.execute(name, JSON.stringify(args), { chatId, claudeBridge, requestApproval: async () => false });
+    };
   } catch {
     // If the hook server can't start, ClaudeCodeBridge falls back to no --settings hook at all —
     // acceptable here since bypassPermissions plus this script's own always-deny loop callback
@@ -84,7 +106,12 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error('Fatal scheduled-runner error:', err);
-  process.exit(1);
-});
+/** `node dist/scheduled-runner.js <id>` (dev) or `AiWindowsAssistant.exe --scheduled-run <id>` (main.ts). */
+export function runScheduledTask(id: number): void {
+  main(id).catch((err) => {
+    console.error('Fatal scheduled-runner error:', err);
+    process.exit(1);
+  });
+}
+
+if (require.main === module) runScheduledTask(Number(process.argv[2]));

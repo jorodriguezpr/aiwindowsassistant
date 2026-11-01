@@ -52,9 +52,13 @@ export function taskName(id: number): string {
   return `AiWindowsAssistant-${id}`;
 }
 
+const IS_PKG = !!(process as unknown as { pkg?: unknown }).pkg;
+
 function runnerCommand(id: number): string {
-  const runnerPath = path.join(config.projectRoot, 'dist', 'scheduled-runner.js');
   // Nested-quote escaping matches the established pattern in utils/autostart.ts.
+  // Installed .exe: the exe itself (no Node.js needed); dev checkout: node + dist/scheduled-runner.js
+  if (IS_PKG) return `\\"${process.execPath}\\" --scheduled-run ${id}`;
+  const runnerPath = path.join(config.projectRoot, 'dist', 'scheduled-runner.js');
   return `node \\"${runnerPath}\\" ${id}`;
 }
 

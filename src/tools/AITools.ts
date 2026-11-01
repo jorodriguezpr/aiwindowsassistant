@@ -15,7 +15,15 @@ import type { ClaudeCodeBridge } from './ClaudeCodeBridge';
 import { SYSADMIN_TOOL_DEFINITIONS, SYSADMIN_TOOL_NAMES, executeSysAdminTool } from './SysAdminTools';
 import { EMAIL_TOOL_DEFINITIONS, executeEmailTool } from './EmailTools';
 import { PDF_TOOL_DEFINITIONS, executePdfTool } from './PdfTools';
+import { WINDOWS_TOOL_DEFINITIONS, WINDOWS_TOOL_NAMES, executeWindowsTool } from './WindowsTools';
+import { UI_TOOL_DEFINITIONS, UI_TOOL_NAMES, executeUiTool } from './UiTools';
+import { REPAIR_TOOL_DEFINITIONS, executeRepairTool, describeRoutine } from '../services/RepairService';
+import { ELEVATED_OPS } from '../elevated/ops';
+import { describeTargets } from '../services/CleanupService';
 import { saveNote as saveNoteToDb } from '../db/NotesStore';
+import { classifyCommand, PolicyDecision } from '../security/CommandPolicy';
+import { sensitivePathIn } from '../security/SensitivePaths';
+import { childEnv } from '../security/SecretStore';
 
 const execAsync = promisify(exec);
 
@@ -23,9 +31,11 @@ export interface ToolContext {
   chatId: number;
   claudeBridge: ClaudeCodeBridge;
   /** Ask the user to approve a destructive action. Resolves true = approved. */
-  requestApproval: (description: string) => Promise<boolean>;
+  requestApproval: (description: string, grantKey?: string) => Promise<boolean>;
   /** Progress updates for long-running tools (e.g. Claude Code runs). */
   onProgress?: (text: string) => void;
+  /** Send a file to the user's chat (screenshots, PDF reports). */
+  sendFile?: (filePath: string, kind: 'photo' | 'document', caption?: string) => Promise<void>;
 }
 
 export interface ToolResult {
@@ -35,44 +45,86 @@ export interface ToolResult {
   [key: string]: unknown;
 }
 
-/** Destructive patterns for Windows / PowerShell (port of AiAgentAssistant's destructive detection). */
-const DESTRUCTIVE_PATTERNS: RegExp[] = [
-  /Remove-Item\b[^\n]*(-Recurse|-Force)/i,
-  /Remove-Item\b[^\n]*[A-Z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData)/i,
-  /\brm\s+(-[a-z]*r|-[a-z]*f)/i,
-  /\bdel\s+\/[sq]/i,
-  /\brd\s+\/s/i,
-  /\brmdir\s+\/s/i,
-  /\bformat\s+[a-z]:/i,
-  /\bshutdown\b/i,
-  /\bRestart-Computer\b/i,
-  /\bStop-Computer\b/i,
-  /\bdiskpart\b/i,
-  /\bbcdedit\b/i,
-  /\breg\s+delete\b/i,
-  /\bRemove-Item\b[^\n]*HKLM/i,
-  /\btaskkill\s+\/f\b/i,
-  /\bStop-Service\b/i,
-  /\bDisable-Service\b/i,
-  /\bSet-Service\b[^\n]*Disabled/i,
-  /\btakeown\b/i,
-  /\bicacls\b[^\n]*\/grant/i,
-  /\bClear-Disk\b/i,
-  /\bRemove-Partition\b/i,
-];
-
 const DESTRUCTIVE_TOOLS = new Set(['delete_file', 'stop_process', 'service_control', 'firewall_rule_manage', 'send_email']);
 
-export function isDestructiveCommand(command: string): boolean {
-  return DESTRUCTIVE_PATTERNS.some((re) => re.test(command));
+function insideDir(p: string, dir: string): boolean {
+  const resolved = path.resolve(p).toLowerCase();
+  const root = path.resolve(dir).toLowerCase();
+  return resolved === root || resolved.startsWith(root + path.sep);
 }
 
-export function isDestructiveToolCall(name: string, args: Record<string, unknown>): boolean {
-  if (DESTRUCTIVE_TOOLS.has(name)) return true;
-  if (name === 'execute_command' && typeof args.command === 'string') {
-    return isDestructiveCommand(args.command);
+const SCRIPT_OR_EXE = /\.(exe|com|bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|hta|msi|msp|reg|scr|pif|cpl|lnk|jar)$/i;
+
+/** launch_program: documents, URLs and installed apps open freely; scripts, shells, downloaded
+ * executables and anything that could smuggle a second command into `start` ask first. */
+function launchDecision(target: string, argsStr: string): PolicyDecision {
+  const sensitive = sensitivePathIn(`${target} ${argsStr}`);
+  if (sensitive) return { verdict: 'deny', reason: `touches a protected location (${sensitive})` };
+  // the target and args are pasted into `cmd /c start …`: metacharacters would run another command
+  if (/["&|<>^%\r\n]/.test(target) || /[&|<>^%\r\n]/.test(argsStr)) return { verdict: 'ask', reason: 'contains shell characters (&, |, >, %…)' };
+  if (/^(https?|mailto|ms-settings):/i.test(target)) return { verdict: 'allow', reason: 'opens a link' };
+  const name = path.basename(target).toLowerCase().replace(/\.(exe|com)$/, '');
+  if (/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|wsl|bash|msiexec|reg|regedit|schtasks|sc|net|certutil|bitsadmin)$/.test(name))
+    return { verdict: 'ask', reason: `starts ${name}, which can run any command` };
+  if (SCRIPT_OR_EXE.test(target) && !/^[a-z]:\\(program files( \(x86\))?|windows)\\/i.test(path.resolve(target)) && /[\\/]/.test(target))
+    return { verdict: 'ask', reason: 'runs a program or script from outside Program Files / Windows' };
+  return { verdict: 'allow', reason: 'opens a document or installed app' };
+}
+
+/**
+ * The policy verdict for one local-engine tool call: allow (run now), ask (owner approves in
+ * Telegram) or deny (never). See src/security/CommandPolicy.ts.
+ */
+export function toolCallDecision(name: string, args: Record<string, unknown>): PolicyDecision {
+  const str = (k: string) => (typeof args[k] === 'string' ? (args[k] as string) : '');
+  const pathArg = str('path') || str('directory');
+  if (pathArg) {
+    const sensitive = sensitivePathIn(pathArg);
+    if (sensitive) return { verdict: 'deny', reason: `touches a protected location (${sensitive})` };
   }
-  return false;
+  switch (name) {
+    case 'execute_command': {
+      const cwdSensitive = sensitivePathIn(str('cwd'));
+      if (cwdSensitive) return { verdict: 'deny', reason: `runs inside a protected location (${cwdSensitive})` };
+      return classifyCommand(str('command'), 'powershell');
+    }
+    case 'launch_program':
+      return launchDecision(str('target'), str('args'));
+    case 'write_file':
+      // like Claude Code's acceptEdits: free inside the workspace and the documents folder
+      return insideDir(str('path'), config.claude.workspace) || insideDir(str('path'), config.assistant.documentsDir)
+        ? { verdict: 'allow', reason: 'inside the workspace' }
+        : { verdict: 'ask', reason: 'writes outside the workspace' };
+    case 'apps_install':
+      return { verdict: 'ask', reason: `installs software (${str('app')})` };
+    case 'apps_upgrade':
+      return { verdict: 'ask', reason: `updates software (${str('app')})` };
+    case 'clean_up_disk':
+      return { verdict: 'ask', reason: `deletes files:
+${describeTargets(str('targets'))}` };
+    // UI Automation: looking is free; acting asks, approvable for 10 min per window (Gate.ts)
+    case 'ui_click':
+    case 'ui_type':
+    case 'ui_keys': {
+      const win = str('window').trim();
+      const what = name === 'ui_click' ? `clicks "${str('target')}"` : name === 'ui_type' ? `types "${str('text').slice(0, 80)}"` : `presses ${str('keys')}`;
+      return { verdict: 'ask', reason: `${what} in the window "${win}"`, grantKey: `ui:${win.toLowerCase()}` };
+    }
+    case 'ui_window':
+      return str('action') === 'close' ? { verdict: 'ask', reason: `closes the window "${str('window')}" (unsaved work would be lost)` } : { verdict: 'allow', reason: 'arranges a window' };
+    case 'run_repair': {
+      const plan = describeRoutine(str('routine'));
+      if (!plan) return { verdict: 'allow', reason: 'unknown routine (fails harmlessly)' };
+      return plan.changes ? { verdict: 'ask', reason: `runs the repair routine:\n${plan.text}` } : { verdict: 'allow', reason: 'read-only diagnosis' };
+    }
+    case 'admin_task': {
+      const op = ELEVATED_OPS[str('task')];
+      if (!op) return { verdict: 'allow', reason: 'unknown task (fails harmlessly)' };
+      return op.risk === 'change' ? { verdict: 'ask', reason: `runs as administrator: ${op.title}${str('param') ? ` (${str('param')})` : ''}` } : { verdict: 'allow', reason: 'read-only or harmless admin job' };
+    }
+    default:
+      return DESTRUCTIVE_TOOLS.has(name) ? { verdict: 'ask', reason: 'changes the system' } : { verdict: 'allow', reason: 'read-only tool' };
+  }
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -214,6 +266,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   ...SYSADMIN_TOOL_DEFINITIONS,
   ...EMAIL_TOOL_DEFINITIONS,
   ...PDF_TOOL_DEFINITIONS,
+  ...WINDOWS_TOOL_DEFINITIONS,
+  ...UI_TOOL_DEFINITIONS,
+  ...REPAIR_TOOL_DEFINITIONS,
 ];
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'out', 'coverage', '$RECYCLE.BIN']);
@@ -268,6 +323,9 @@ export class AIToolExecutor {
         return executePdfTool(name, args);
       default:
         if (SYSADMIN_TOOL_NAMES.has(name)) return executeSysAdminTool(name, args);
+        if (WINDOWS_TOOL_NAMES.has(name)) return executeWindowsTool(name, args, ctx);
+        if (UI_TOOL_NAMES.has(name)) return executeUiTool(name, args);
+        if (name === 'run_repair') return executeRepairTool(args, ctx, (n, a) => this.dispatch(n, a, ctx));
         return { success: false, error: `Unknown tool: ${name}` };
     }
   }
@@ -288,7 +346,7 @@ export class AIToolExecutor {
         timeout: 120000,
         maxBuffer: 1024 * 1024,
         windowsHide: true,
-        env: { ...process.env, POWERSHELL_TELEMETRY_OPTOUT: '1' },
+        env: childEnv({ POWERSHELL_TELEMETRY_OPTOUT: '1' }),
       });
       return { success: true, stdout: stdout.slice(0, 600), stderr: stderr.slice(0, 300), cwd: workDir };
     } catch (err) {
@@ -309,7 +367,7 @@ export class AIToolExecutor {
     return new Promise((resolve) => {
       // `start` handles programs, files and URLs via shell association
       const cmdLine = argsStr ? `start "" "${target}" ${argsStr}` : `start "" "${target}"`;
-      const proc = spawn('cmd.exe', ['/c', cmdLine], { detached: true, stdio: 'ignore', windowsHide: true });
+      const proc = spawn('cmd.exe', ['/c', cmdLine], { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv() });
       proc.on('error', (err) => resolve({ success: false, error: err.message }));
       proc.unref();
       // `start` returns immediately; give it a moment to surface immediate errors

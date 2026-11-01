@@ -25,6 +25,7 @@ import * as path from 'path';
 import { config, HOSTNAME } from '../config';
 import { ClaudeCodeBridge } from '../tools/ClaudeCodeBridge';
 import type { TelegramGateway } from '../gateways/TelegramGateway';
+import { hookCommand } from '../utils/launcher';
 import type { Logger } from '../logger';
 
 interface PendingDelegation {
@@ -140,14 +141,13 @@ export class BJavaDecompilerPollService {
    * lifecycles never interfere even though the content is currently identical. */
   private ensureHookSettings(): string {
     if (this.hookSettingsPath) return this.hookSettingsPath;
-    const hookScript = path.join(config.projectRoot, 'scripts', 'claude-readonly-hook.js');
     const settingsPath = path.join(config.dataDir, 'bjavadecompiler-delegation-readonly-settings.json');
     const settings = {
       hooks: {
         PreToolUse: [
           {
             matcher: '.*',
-            hooks: [{ type: 'command', command: `node "${hookScript}"`, timeout: 30 }],
+            hooks: [{ type: 'command', command: hookCommand('readonly'), timeout: 30 }],
           },
         ],
       },

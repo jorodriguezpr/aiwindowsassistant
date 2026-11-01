@@ -6,9 +6,19 @@
 
 import { Telegraf, Context } from 'telegraf';
 import { v4 as uuidv4 } from 'uuid';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import axios from 'axios';
 import { config } from '../config';
 import { AIProvider } from '../providers/AIProvider';
-import { AIToolExecutor, isDestructiveToolCall } from '../tools/AITools';
+import { AIToolExecutor } from '../tools/AITools';
+import { gateToolCall, grant } from '../security/Gate';
+import { MCP_TOOL_NAMES } from '../mcp/McpServer';
+import { listRoutines } from '../services/RepairService';
+import type { WebChat } from './WebChat';
+import type { AlertService } from '../services/AlertService';
 import { ClaudeCodeBridge } from '../tools/ClaudeCodeBridge';
 import { AgentLoop } from '../core/AgentLoop';
 import { RequestAnalyzer } from '../core/RequestAnalyzer';
@@ -19,6 +29,12 @@ import * as chatState from '../db/ChatStateStore';
 import { saveNote, listRecentNotes, searchNotes } from '../db/NotesStore';
 import { createScheduledTask, listScheduledTasks, deleteScheduledTask, getScheduledTask } from '../db/ScheduleStore';
 import { parseScheduleDesc, registerWindowsTask, unregisterWindowsTask } from '../services/SchedulerService';
+import { runDoctor } from '../services/DoctorService';
+import { ToastService } from '../services/ToastService';
+import { HEALTH_PROMPT } from '../services/HealthCheckService';
+import { helperState, HELPER_MISSING } from '../elevated/client';
+import { ELEVATED_OPS } from '../elevated/ops';
+import type { ApprovalHookServer } from '../tools/ApprovalHookServer';
 import type { Logger } from '../logger';
 
 /** Splits off the first N whitespace-separated tokens, preserving the untouched remainder
@@ -40,6 +56,12 @@ interface PendingApproval {
   description: string;
   resolve: (approved: boolean) => void;
   timer: NodeJS.Timeout;
+  /** Random per approval: what a Windows notification's Approve/Deny button carries. */
+  nonce: string;
+  /** The Telegram prompt, edited when the answer comes from the PC instead. */
+  messageId?: number;
+  /** Offered as "Approve all here for 10 min" (Gate.ts). */
+  grantKey?: string;
 }
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes, same as AiAgentAssistant
@@ -55,6 +77,19 @@ const HELP_TEXT = `*AiWindowsAssistant* — delegate tasks from your phone 🤖
 /provider [anthropic|ollama-cloud|ollama] — Show/switch AI provider (used by the local-model engine)
 /aimodel [model] — Show/change model
 /status — Bot, provider, Claude CLI, queue status
+/doctor — Check everything works: settings, secrets, Claude Code, approval gate, AI, email, database
+
+*Windows*
+/screenshot — Screenshot of the PC (or send a photo of an error and ask about it)
+/settings <page> — Open a Settings page (bluetooth, display, windows update…)
+/cleanup — What can be cleaned, then /cleanup run all-safe (or a list of targets) to free space
+/health — PC health report (PDF); /health weekly on|off — every week, automatically
+/apps — Apps with updates; /apps search|install|upgrade <app>, /apps upgrade all
+/admin — Administrator jobs (Windows updates, BitLocker, restore point, services…)
+/fix — Repair routines: internet, printer, sound, search, windows-update, system-files, free-space, slow-pc
+/alerts — Proactive alerts (disk full, threats, crashes, new startup programs…); on|off|check|reset
+
+At the PC: Ctrl+Alt+Space opens a chat window with this same conversation.
 /clear — Reset conversation + Claude Code session
 /cancel — Cancel the running task
 /pause, /resume — Pause/resume the bot
@@ -85,21 +120,58 @@ export class TelegramGateway {
   /** Which engine handles plain text / /task by default — switchable via /engine. */
   private defaultEngine: 'claude' | 'ollama' = 'claude';
 
+  private approvalServer: ApprovalHookServer | null = null;
+  /** Windows notifications: approvals with Approve/Deny at the PC, long-task completions. */
+  readonly toast: ToastService;
+
   paused = false;
   /** Tray menu hook — called whenever pause state changes. */
   onPauseChanged?: (paused: boolean) => void;
 
   constructor(claudeBridge: ClaudeCodeBridge, orchestrator: Orchestrator, logger?: Logger) {
     this.bot = new Telegraf(config.telegram.token, { handlerTimeout: 1_200_000 });
+    // everything the bot says to the owner also appears in the chat window at the PC (WebChat)
+    const tg = this.bot.telegram as unknown as { callApi: (m: string, p: Record<string, unknown>, o?: unknown) => Promise<unknown> };
+    const callApi = tg.callApi.bind(tg);
+    tg.callApi = async (method, payload, opts) => {
+      const res = await callApi(method, payload, opts);
+      try {
+        this.mirror(method, payload || {}, res as { message_id?: number });
+      } catch {
+        /* the window is a convenience; never break Telegram for it */
+      }
+      return res;
+    };
     this.provider = new AIProvider(logger);
     this.loop = new AgentLoop(this.provider, this.executor, logger);
     this.claudeBridge = claudeBridge;
     this.orchestrator = orchestrator;
     this.logger = logger;
 
+    this.toast = new ToastService(logger);
+    this.toast.register();
+
     this.setupMiddleware();
     this.setupCommands();
     this.setupHandlers();
+  }
+
+  /** index.ts: lets /doctor test the approval gate it started. */
+  setApprovalServer(server: ApprovalHookServer): void {
+    this.approvalServer = server;
+    server.onToastAction = this.handleToastAction;
+    // Claude Code's MCP tool calls (src/mcp/McpServer.ts): same gate, same approvals, files to this chat
+    server.toolRunner = async (chatId, name, args) => {
+      if (!this.isAllowed(chatId) || !MCP_TOOL_NAMES.has(name)) return { success: false, error: `tool ${name} is not available` };
+      const gate = await gateToolCall(chatId, name, args, `🤖 Claude Code → ${name} ${JSON.stringify(args).slice(0, 200)}`, (d, key) => this.requestApproval(chatId, d, key));
+      if (!gate.ok) return { success: false, error: gate.error };
+      return this.executor.execute(name, JSON.stringify(args), {
+        chatId,
+        claudeBridge: this.claudeBridge,
+        requestApproval: (d, key) => this.requestApproval(chatId, d, key),
+        sendFile: (f, kind, caption) => this.sendFile(chatId, f, kind, caption),
+      });
+    };
   }
 
   // ---------- setup ----------
@@ -162,6 +234,11 @@ export class TelegramGateway {
       );
     });
 
+    this.bot.command('doctor', async (ctx) => {
+      await ctx.reply('🩺 Checking…');
+      await this.sendLong(ctx.chat.id, await runDoctor(this.claudeBridge, this.approvalServer, this.provider.getProvider()));
+    });
+
     this.bot.command('task', (ctx) => this.handleDelegatedText(ctx, this.commandArgs(ctx), { skipFastPath: true }));
     this.bot.command('ai', (ctx) => this.handleDelegatedText(ctx, this.commandArgs(ctx), { skipFastPath: true, forceEngine: 'ollama' }));
 
@@ -177,6 +254,91 @@ export class TelegramGateway {
       const prompt = this.commandArgs(ctx);
       if (!prompt) return ctx.reply('Usage: /claude <prompt for Claude Code>');
       void this.orchestrator.submit(ctx.chat.id, () => this.runClaudeTask(ctx.chat.id, prompt));
+    });
+
+    // ---------- Windows 11 (1.4.0) — all through runToolDirect, so the policy + approval apply ----------
+    const tool = (ctx: Context, name: string, args: Record<string, unknown>, description: string) =>
+      void this.orchestrator.submit(ctx.chat!.id, () => this.runToolDirect(ctx.chat!.id, name, args, description));
+
+    this.bot.command('screenshot', (ctx) => tool(ctx, 'take_screenshot', {}, 'Screenshot'));
+
+    this.bot.command('settings', (ctx) => {
+      const page = this.commandArgs(ctx) || 'settings';
+      tool(ctx, 'open_settings', { page }, `Open Settings → ${page}`);
+    });
+
+    this.bot.command('cleanup', (ctx) => {
+      const m = /^run\s+(.+)$/i.exec(this.commandArgs(ctx));
+      if (m) tool(ctx, 'clean_up_disk', { targets: m[1] }, `Clean up: ${m[1]}`);
+      else tool(ctx, 'analyze_disk_space', {}, 'What can be cleaned');
+    });
+
+    this.bot.command('health', async (ctx) => {
+      const arg = this.commandArgs(ctx);
+      const weekly = /^weekly(?:\s+(on|off))?(?:\s+([a-z]{3})\s+(\d\d:\d\d))?$/i.exec(arg);
+      if (!weekly) return tool(ctx, 'health_report', {}, 'Health report');
+      const existing = listScheduledTasks(ctx.chat.id).filter((t) => t.prompt === HEALTH_PROMPT);
+      if ((weekly[1] || 'on').toLowerCase() === 'off') {
+        for (const t of existing) {
+          unregisterWindowsTask(t.id);
+          deleteScheduledTask(t.id);
+        }
+        return ctx.reply(existing.length ? '🗓 Weekly health report turned off.' : 'No weekly health report was scheduled.');
+      }
+      if (existing.length) return ctx.reply(`🗓 Already scheduled (${existing[0].scheduleDesc}). /health weekly off to stop it.`);
+      const desc = `weekly ${(weekly[2] || 'MON').toUpperCase()} ${weekly[3] || '09:00'}`;
+      const spec = parseScheduleDesc(desc);
+      if (!spec) return ctx.reply('Usage: /health weekly on [MON 09:00] | /health weekly off');
+      const id = createScheduledTask(ctx.chat.id, 'Weekly health report', desc, HEALTH_PROMPT, 'claude');
+      try {
+        registerWindowsTask(id, spec);
+      } catch (err) {
+        deleteScheduledTask(id);
+        return ctx.reply(`❌ Could not create the Windows scheduled task: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return ctx.reply(`🗓 Weekly health report scheduled (${desc}). The PDF arrives here — read-only, no approvals needed.`);
+    });
+
+    this.bot.command('apps', (ctx) => {
+      const arg = this.commandArgs(ctx);
+      const m = /^(search|install|upgrade|update)\s+(.+)$/i.exec(arg);
+      if (!m) return tool(ctx, 'apps_updates', {}, 'Apps with updates');
+      const verb = m[1].toLowerCase();
+      if (verb === 'search') return tool(ctx, 'apps_search', { query: m[2] }, `Search apps: ${m[2]}`);
+      if (verb === 'install') return tool(ctx, 'apps_install', { app: m[2] }, `Install ${m[2]} (winget)`);
+      return tool(ctx, 'apps_upgrade', { app: m[2] }, `Update ${m[2]} (winget)`);
+    });
+
+    this.bot.command('fix', (ctx) => {
+      const name = this.commandArgs(ctx).toLowerCase();
+      if (!name) return ctx.reply(`🛠 Repair routines — /fix <name>:\n${listRoutines()}\n\nYou approve each routine once; the ones that change the system take a restore point first.`);
+      tool(ctx, 'run_repair', { routine: name }, `Repair: ${name}`);
+    });
+
+    this.bot.command('alerts', async (ctx) => {
+      if (!this.alerts) return ctx.reply('Alerts are not running in this process.');
+      const arg = this.commandArgs(ctx).toLowerCase();
+      if (arg === 'off' || arg === 'on') {
+        this.alerts.setEnabled(arg === 'on');
+        return ctx.reply(arg === 'on' ? '🔔 Alerts on.' : '🔕 Alerts off.');
+      }
+      if (arg === 'reset') return ctx.reply(`🔔 New baseline: ${await this.alerts.reset()} startup programs, services and tasks count as known now.`);
+      if (arg === 'check') {
+        const sent = await this.alerts.check();
+        return ctx.reply(sent.length ? `🔔 ${sent.length} alert(s) sent.` : '🔔 Checked — nothing new.');
+      }
+      return ctx.reply(this.alerts.status());
+    });
+
+    this.bot.command('admin', (ctx) => {
+      const [task, ...rest] = this.commandArgs(ctx).split(/\s+/).filter(Boolean);
+      if (!task) {
+        const st = helperState();
+        const state = st.running ? (st.admin ? '🟢 running as administrator' : '🔴 running WITHOUT administrator rights') : '⚪ not installed / not running';
+        const list = Object.entries(ELEVATED_OPS).map(([k, v]) => `• ${k}${v.paramHelp ? ` <${v.paramHelp}>` : ''} — ${v.title}${v.risk === 'change' ? ' (asks first)' : ''}`);
+        return ctx.reply(`🛡 Administrator helper: ${state}${st.outdated ? ' — outdated, re-run the install' : ''}\n\n/admin <task> [param]:\n${list.join('\n')}${st.running ? '' : `\n\n${HELPER_MISSING}`}`);
+      }
+      tool(ctx, 'admin_task', { task, param: rest.join(' ') }, `Admin: ${task}${rest.length ? ' ' + rest.join(' ') : ''}`);
     });
 
     this.bot.command('execute', async (ctx) => {
@@ -327,21 +489,18 @@ export class TelegramGateway {
   private setupHandlers(): void {
     this.bot.on('callback_query', async (ctx) => {
       const data = (ctx.callbackQuery as { data?: string }).data || '';
-      const [action, id] = data.split(':');
-      const pending = this.pendingApprovals.get(id);
-      if (!pending) {
-        await ctx.answerCbQuery('Expired or already handled');
-        return;
-      }
-      this.pendingApprovals.delete(id);
-      clearTimeout(pending.timer);
-      const approved = action === 'appr';
-      await ctx.answerCbQuery(approved ? 'Approved' : 'Denied');
-      await ctx.editMessageText(
-        `${pending.description}\n\n${approved ? '✅ Approved' : '❌ Denied'}`,
-        { parse_mode: 'Markdown' }
-      ).catch(() => undefined);
-      pending.resolve(approved);
+      const answered = this.answerButton(data, 'Telegram');
+      await ctx.answerCbQuery(answered === null ? 'Expired or already handled' : answered ? 'Approved' : 'Denied');
+    });
+
+    this.bot.on('photo', (ctx) => {
+      const sizes = ctx.message.photo;
+      return this.handlePhoto(ctx, sizes[sizes.length - 1].file_id, ctx.message.caption || '');
+    });
+    this.bot.on('document', (ctx) => {
+      const d = ctx.message.document;
+      if (!/^image\//.test(d.mime_type || '')) return ctx.reply('I can look at images (photos or image files). Other files are not supported yet.');
+      return this.handlePhoto(ctx, d.file_id, ctx.message.caption || '');
     });
 
     this.bot.on('text', (ctx) => this.handleDelegatedText(ctx, ctx.message.text, { skipFastPath: false }));
@@ -401,18 +560,25 @@ export class TelegramGateway {
 
         // Local AgentLoop (Ollama/Anthropic provider, tool-calling loop)
         await this.sendProgress(chatId, '🧠 Thinking…');
+        const started = Date.now();
         const result = await this.loop.run(
           chatId,
           text,
-          { chatId, claudeBridge: this.claudeBridge, onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`) },
+          {
+            chatId,
+            claudeBridge: this.claudeBridge,
+            onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+            sendFile: (f, kind, caption) => this.sendFile(chatId, f, kind, caption),
+          },
           {
             sendProgress: (t) => this.sendProgressThrottled(chatId, t),
-            requestApproval: (desc) => this.requestApproval(chatId, desc),
+            requestApproval: (desc, key) => this.requestApproval(chatId, desc, key),
             onToolProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
           }
         );
         await this.clearProgress(chatId);
         await this.sendLong(chatId, result.response);
+        this.toastIfLong(started, text, result.response);
       } catch (err) {
         await this.clearProgress(chatId);
         const msg = err instanceof Error ? err.message : String(err);
@@ -427,12 +593,10 @@ export class TelegramGateway {
     const pendingId = chatState.startPendingTask(chatId, description);
     let ok = false;
     try {
-      if (isDestructiveToolCall(tool, args)) {
-        const approved = await this.requestApproval(chatId, `⚠️ *Destructive action*\n${description}`);
-        if (!approved) {
-          await this.bot.telegram.sendMessage(chatId, '❌ Denied.');
-          return;
-        }
+      const gate = await gateToolCall(chatId, tool, args, description, (d, key) => this.requestApproval(chatId, d, key));
+      if (!gate.ok) {
+        await this.bot.telegram.sendMessage(chatId, gate.blocked ? `⛔ ${gate.error}\n${description}` : '❌ Denied.');
+        return;
       }
       await this.sendTyping(chatId);
       const result = await this.executor.execute(tool, JSON.stringify(args), {
@@ -440,6 +604,7 @@ export class TelegramGateway {
         claudeBridge: this.claudeBridge,
         requestApproval: (d) => this.requestApproval(chatId, d),
         onProgress: (t) => void this.sendProgressThrottled(chatId, `🤖 Claude Code:\n${this.tail(t)}`),
+        sendFile: (f, kind, caption) => this.sendFile(chatId, f, kind, caption),
       });
       ok = result.success;
       const out = result.success
@@ -459,9 +624,10 @@ export class TelegramGateway {
    * from within that callback would deadlock: the outer task would wait on the inner one,
    * which waits on the outer one finishing first).
    */
-  private async runClaudeTask(chatId: number, prompt: string): Promise<void> {
-    const pendingId = chatState.startPendingTask(chatId, prompt);
+  private async runClaudeTask(chatId: number, prompt: string, label = prompt): Promise<void> {
+    const pendingId = chatState.startPendingTask(chatId, label);
     let ok = false;
+    const started = Date.now();
     try {
       await this.sendTyping(chatId);
       await this.sendProgress(chatId, '🤖 Claude Code is working…');
@@ -470,6 +636,7 @@ export class TelegramGateway {
       });
       await this.clearProgress(chatId);
       ok = result.success;
+      this.toastIfLong(started, label, result.success ? result.output : `Failed: ${result.error}`);
       if (result.success) {
         await this.sendLong(chatId, result.output || '✅ Done (no output).');
       } else {
@@ -481,38 +648,119 @@ export class TelegramGateway {
     }
   }
 
+  /** Screenshots and reports: photo when small enough, otherwise as a file. */
+  private async sendFile(chatId: number, file: string, kind: 'photo' | 'document', caption?: string): Promise<void> {
+    if (kind === 'photo') await this.bot.telegram.sendPhoto(chatId, { source: file }, { caption });
+    else await this.bot.telegram.sendDocument(chatId, { source: file, filename: path.basename(file) }, { caption });
+  }
+
+  /** A Windows notification when a task took long enough that you may have walked away. */
+  private toastIfLong(started: number, label: string, result: string): void {
+    if (Date.now() - started < config.toast.longTaskSeconds * 1000) return;
+    this.toast.notify(`Task finished: ${label.slice(0, 60)}`, result.slice(0, 250));
+  }
+
+  /**
+   * A photo (or image file) from the phone: "what does this error mean?" — saved to a temp
+   * file Claude Code opens with its Read tool, then deleted. Always Claude Code: the local
+   * models can't see images.
+   */
+  private handlePhoto(ctx: Context, fileId: string, caption: string): Promise<unknown> | void {
+    if (this.paused) return ctx.reply('⏸ Bot is paused. Use /resume to continue.');
+    const chatId = ctx.chat!.id;
+    void this.orchestrator.submit(chatId, async () => {
+      const dir = path.join(os.tmpdir(), 'aiwa-photos');
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.jpg`);
+      try {
+        const link = await this.bot.telegram.getFileLink(fileId);
+        const res = await axios.get<ArrayBuffer>(link.toString(), { responseType: 'arraybuffer', timeout: 60000, maxContentLength: 20 * 1024 * 1024 });
+        fs.writeFileSync(file, Buffer.from(res.data));
+        const ask = caption.trim() || 'What is in this picture? If it shows an error or a problem on a Windows PC, explain it simply and say how to fix it.';
+        await this.runClaudeTask(chatId, `${ask}\n\n[The user sent a picture from their phone. It is saved at ${file} — open it with the Read tool to see it.]`, `📷 ${ask.slice(0, 80)}`);
+      } catch (err) {
+        await this.sendLong(chatId, `❌ Could not process the picture: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+    });
+  }
+
   // ---------- approvals ----------
 
   /** Public: also used by ApprovalHookServer to gate Claude Code's own tool calls. */
-  requestApproval = (chatId: number, description: string): Promise<boolean> => {
+  requestApproval = (chatId: number, description: string, grantKey?: string): Promise<boolean> => {
     return new Promise((resolve) => {
       const id = uuidv4().slice(0, 8);
       const timer = setTimeout(() => {
         if (this.pendingApprovals.delete(id)) {
+          this.toast.remove(id);
           this.bot.telegram.sendMessage(chatId, '⏱ Approval expired — action cancelled.').catch(() => undefined);
           resolve(false);
         }
       }, APPROVAL_TIMEOUT_MS);
-      this.pendingApprovals.set(id, { chatId, description, resolve, timer });
+      const nonce = crypto.randomBytes(16).toString('hex');
+      const pending: PendingApproval = { chatId, description, resolve, timer, nonce, grantKey };
+      this.pendingApprovals.set(id, pending);
+      // at the PC too: a Windows notification with Approve / Deny (first answer wins)
+      this.toast.approval(id, nonce, description);
+      const reply_markup = {
+        inline_keyboard: [
+          [
+            { text: '✅ Approve', callback_data: `appr:${id}` },
+            { text: '❌ Deny', callback_data: `deny:${id}` },
+          ],
+          // bursts of small steps in one place (UI clicks in one window): approve them all for 10 min
+          ...(grantKey ? [[{ text: '⏱ Approve all here for 10 min', callback_data: `gr10:${id}` }]] : []),
+        ],
+      };
+      // Commands are full of Markdown characters ($_.Name, *.txt): when Telegram rejects the
+      // Markdown, send the same text plain instead of silently treating it as a denial.
       this.bot.telegram
-        .sendMessage(chatId, `⚠️ *Approval required*\n${description}`, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ Approve', callback_data: `appr:${id}` },
-                { text: '❌ Deny', callback_data: `deny:${id}` },
-              ],
-            ],
-          },
+        .sendMessage(chatId, `⚠️ *Approval required*\n${description}`, { parse_mode: 'Markdown', reply_markup })
+        .catch(() => this.bot.telegram.sendMessage(chatId, `⚠️ Approval required\n${description}`, { reply_markup }))
+        .then((msg) => {
+          pending.messageId = msg.message_id;
         })
         .catch((err) => {
+          // Telegram unreachable: the Windows notification may still be answered at the PC
           this.logger?.error({ err }, 'failed to send approval request');
-          clearTimeout(timer);
-          this.pendingApprovals.delete(id);
-          resolve(false);
+          if (!this.toast.enabled) this.settleApproval(id, false, 'error');
         });
     });
+  };
+
+  /** One answer per approval, from Telegram or the PC (Windows notification). False if already settled. */
+  /** An Approve / Deny / 10-min button (callback data "appr:id"…). null = expired or already answered. */
+  answerButton(data: string, via: 'Telegram' | 'chat window'): boolean | null {
+    const [action, id] = data.split(':');
+    const approved = action === 'appr' || action === 'gr10';
+    const p = this.pendingApprovals.get(id);
+    if (action === 'gr10' && p?.grantKey) grant(p.chatId, p.grantKey, 10);
+    return this.settleApproval(id, approved, via) ? approved : null;
+  }
+
+  private settleApproval(id: string, approved: boolean, via: 'Telegram' | 'this PC' | 'chat window' | 'error'): boolean {
+    const pending = this.pendingApprovals.get(id);
+    if (!pending) return false;
+    this.pendingApprovals.delete(id);
+    clearTimeout(pending.timer);
+    if (via !== 'this PC') this.toast.remove(id);
+    if (pending.messageId) {
+      const text = `${pending.description}\n\n${approved ? '✅ Approved' : '❌ Denied'}${via === 'this PC' ? ' (at the PC)' : via === 'chat window' ? ' (in the chat window)' : ''}`;
+      this.bot.telegram
+        .editMessageText(pending.chatId, pending.messageId, undefined, text, { parse_mode: 'Markdown' })
+        .catch(() => this.bot.telegram.editMessageText(pending.chatId, pending.messageId, undefined, text.replace(/[*_`]/g, '')))
+        .catch(() => undefined);
+    }
+    pending.resolve(approved);
+    return true;
+  }
+
+  /** ApprovalHookServer /toast: a click on a Windows notification's Approve/Deny button. */
+  handleToastAction = (nonce: string, approve: boolean): boolean => {
+    for (const [id, p] of this.pendingApprovals) if (p.nonce === nonce) return this.settleApproval(id, approve, 'this PC');
+    return false;
   };
 
   // ---------- telegram helpers ----------
@@ -582,6 +830,15 @@ export class TelegramGateway {
       { command: 'provider', description: 'Show/switch AI provider' },
       { command: 'aimodel', description: 'Show/change model' },
       { command: 'status', description: 'Bot status' },
+      { command: 'doctor', description: 'Check everything works' },
+      { command: 'screenshot', description: 'Screenshot of the PC' },
+      { command: 'settings', description: 'Open a Settings page' },
+      { command: 'cleanup', description: 'Free disk space' },
+      { command: 'health', description: 'PC health report (PDF)' },
+      { command: 'apps', description: 'Install/update apps (winget)' },
+      { command: 'admin', description: 'Administrator jobs' },
+      { command: 'fix', description: 'Repair routines' },
+      { command: 'alerts', description: 'Proactive alerts' },
       { command: 'clear', description: 'Reset conversation' },
       { command: 'cancel', description: 'Cancel running task' },
       { command: 'pause', description: 'Pause bot' },
@@ -593,6 +850,45 @@ export class TelegramGateway {
     const me = await this.bot.telegram.getMe();
     this.botUsername = me.username || '';
     this.logger?.info({ username: this.botUsername }, 'telegram bot launched');
+  }
+
+  /** Set by index.ts when the chat window runs. */
+  webChat?: WebChat;
+  /** Set by index.ts: proactive alerts, for /alerts. */
+  alerts?: AlertService;
+
+  private mirror(method: string, p: Record<string, unknown>, res: { message_id?: number }): void {
+    if (!this.webChat || !this.isAllowed(Number(p.chat_id))) return;
+    if (method === 'sendMessage') {
+      const kb = (p.reply_markup as { inline_keyboard?: { text: string; callback_data?: string }[][] } | undefined)?.inline_keyboard || [];
+      const buttons = kb.flat().filter((b) => b.callback_data).map((b) => [b.text, b.callback_data!] as [string, string]);
+      this.webChat.push({ mid: res?.message_id, who: 'bot', text: String(p.text || ''), buttons });
+    } else if (method === 'editMessageText') {
+      this.webChat.push({ mid: Number(p.message_id), who: 'bot', text: String(p.text || '') });
+    } else if (method === 'deleteMessage') {
+      this.webChat.push({ mid: Number(p.message_id), who: 'bot', text: '', deleted: true });
+    } else if (method === 'sendPhoto' || method === 'sendDocument') {
+      this.webChat.push({ who: 'note', text: `📎 ${String(p.caption || 'A file')} — sent to Telegram` });
+    }
+  }
+
+  /** Text typed in the chat window: handled exactly like a Telegram message from the owner. */
+  injectOwnerText(text: string): void {
+    const [owner] = config.telegram.allowedUsers;
+    if (!owner) return;
+    const command = /^\/\w+/.exec(text);
+    const update = {
+      update_id: 0,
+      message: {
+        message_id: 0,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: owner, type: 'private', first_name: 'PC' },
+        from: { id: owner, is_bot: false, first_name: 'PC' },
+        text,
+        ...(command ? { entities: [{ type: 'bot_command', offset: 0, length: command[0].length }] } : {}),
+      },
+    };
+    void this.bot.handleUpdate(update as unknown as Parameters<Telegraf['handleUpdate']>[0]).catch((err) => this.logger?.error({ err }, 'chat window message failed'));
   }
 
   async notifyOwner(text: string): Promise<void> {

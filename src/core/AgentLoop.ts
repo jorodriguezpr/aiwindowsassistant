@@ -5,7 +5,8 @@
  */
 
 import { AIProvider, ChatMessage, ToolCall } from '../providers/AIProvider';
-import { AIToolExecutor, ToolContext, isDestructiveToolCall, TOOL_DEFINITIONS } from '../tools/AITools';
+import { AIToolExecutor, ToolContext, TOOL_DEFINITIONS } from '../tools/AITools';
+import { gateToolCall } from '../security/Gate';
 import { config } from '../config';
 import * as chatState from '../db/ChatStateStore';
 import { listRecentNotes } from '../db/NotesStore';
@@ -15,7 +16,7 @@ export interface LoopCallbacks {
   /** Send/edit a progress message (throttled by the gateway). */
   sendProgress: (text: string) => Promise<void>;
   /** Ask user to approve a destructive action. true = approved. */
-  requestApproval: (description: string) => Promise<boolean>;
+  requestApproval: (description: string, grantKey?: string) => Promise<boolean>;
   /** Progress from long-running tools (Claude Code bridge). */
   onToolProgress?: (text: string) => void;
 }
@@ -140,19 +141,17 @@ export class AgentLoop {
           /* keep {} */
         }
 
-        // Destructive approval gate (same flow as AiAgentAssistant)
-        if (isDestructiveToolCall(tc.name, parsedArgs)) {
-          const desc = this.describeToolCall(tc.name, parsedArgs);
-          const approved = await cb.requestApproval(desc);
-          if (!approved) {
-            this.pushMessage(chatId, history, {
-              role: 'tool',
-              tool_call_id: tc.id,
-              name: tc.name,
-              content: JSON.stringify({ success: false, error: 'Denied by user' }),
-            });
-            continue;
-          }
+        // Command policy + owner approval (src/security/Gate.ts): allow / ask / never
+        const gate = await gateToolCall(chatId, tc.name, parsedArgs, this.describeToolCall(tc.name, parsedArgs), cb.requestApproval);
+        if (!gate.ok) {
+          if (gate.blocked) await cb.sendProgress(`⛔ ${this.describeToolCall(tc.name, parsedArgs)} — ${gate.error}`);
+          this.pushMessage(chatId, history, {
+            role: 'tool',
+            tool_call_id: tc.id,
+            name: tc.name,
+            content: JSON.stringify({ success: false, error: gate.error }),
+          });
+          continue;
         }
 
         await cb.sendProgress(`⚙️ ${this.describeToolCall(tc.name, parsedArgs)}`);
@@ -161,6 +160,7 @@ export class AgentLoop {
           claudeBridge: ctx.claudeBridge,
           requestApproval: cb.requestApproval,
           onProgress: cb.onToolProgress,
+          sendFile: ctx.sendFile,
         });
         this.pushMessage(chatId, history, {
           role: 'tool',

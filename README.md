@@ -55,7 +55,30 @@ Sole contributor: Jose Rodriguez Arroyo.
 
 ## Installation
 
-### Quick install (Windows, recommended)
+### Windows installer (recommended)
+
+Download **`AiWindowsAssistant-Setup-<version>.exe`** from the
+[latest release](https://github.com/jorodriguezpr/aiwindowsassistant/releases/latest) and run it.
+No administrator rights and no Node.js needed — it installs a single self-contained program for
+your user (`%LOCALAPPDATA%\Programs\AiWindowsAssistant`) and asks for:
+
+1. your Telegram bot token (from @BotFather) and, if you know it, your chat ID;
+2. the local AI service (Ollama Cloud, Anthropic API or Ollama on the PC) and its key;
+3. the folder the assistant may work in.
+
+Options: start with Windows, desktop shortcut, and the **administrator helper** (one UAC prompt).
+Your secrets are encrypted with Windows (DPAPI) right after installing. Upgrading keeps your
+settings; uninstalling (Settings → Apps) asks whether to keep your settings and history.
+
+The program is not code-signed yet: Windows SmartScreen may show "Windows protected your PC" —
+choose *More info → Run anyway*.
+
+For the Claude Code engine, install Claude Code separately and run `claude` once to sign in.
+
+Building the installer yourself: `npm run release` (needs Inno Setup 6:
+`winget install JRSoftware.InnoSetup`) → `pkg-dist/AiWindowsAssistant-Setup-<version>.exe`.
+
+### Quick install from source (developers)
 
 One PowerShell command on a fresh machine — installs Git and Node.js if missing (via `winget`),
 clones the repo, installs npm dependencies and the Claude Code CLI, scaffolds `.env`, and builds:
@@ -101,6 +124,8 @@ Security notes).
 | `AUTO_START` | `true` to register the Windows autostart launcher on boot |
 | `DOCUMENTS_DIR` | Where `generate_pdf` writes files. Defaults to `Documents\AiWindowsAssistant` |
 | `EMAIL_SMTP_HOST` / `_PORT` / `_SECURE` / `_USER` / `_PASS` / `EMAIL_FROM` | SMTP config for `send_email` — leave `EMAIL_SMTP_HOST` empty to disable the tool entirely (send-only, no inbox reading) |
+| `TRUSTED_COMMANDS` | Comma-separated commands that run without approval, e.g. `git,npm,node` (their dangerous forms still ask) |
+| `SENSITIVE_PATHS` | Extra folders/files no command or tool may ever touch (comma-separated) |
 
 Full list with defaults: see [`.env.example`](.env.example).
 
@@ -116,6 +141,13 @@ Full list with defaults: see [`.env.example`](.env.example).
 | `/provider [anthropic\|ollama-cloud\|ollama]` | Show/switch the local-model provider |
 | `/aimodel [model]` | Show/change the local model |
 | `/status` | Bot, engine, provider, Claude CLI, and queue status |
+| `/doctor` | Check everything works: settings, secrets, Claude Code, approval gate, AI provider, email, database |
+| `/screenshot` | Screenshot of the PC's screen(s) — or send a **photo** (e.g. of an error message) and ask about it |
+| `/settings <page>` | Open a Windows Settings page: bluetooth, display, wifi, windows update, default apps… |
+| `/cleanup` · `/cleanup run all-safe` | What can be cleaned (temp, browser/npm/pip caches, crash dumps, old installers, Windows Update cache…), then clean it (asks first) |
+| `/health` · `/health weekly on\|off` | PC health report as a PDF (disks, updates, Defender, firewall, restarts, errors, memory, BitLocker) — once, or every week automatically |
+| `/apps` · `/apps search\|install\|upgrade <app>` · `/apps upgrade all` | Apps with winget: what needs updating, search, install, update (install/update ask first) |
+| `/admin` · `/admin <task> [param]` | Administrator jobs through the helper: Windows updates, BitLocker, Defender scan, restore point, restart a service, hibernation/page file, system clean-up, sfc |
 | `/clear` | Reset conversation + Claude Code session for this chat |
 | `/cancel` | Cancel the currently running task |
 | `/pause` / `/resume` | Stop/resume processing new messages |
@@ -126,16 +158,99 @@ Full list with defaults: see [`.env.example`](.env.example).
 
 Or just type naturally — fast local actions run instantly, anything else is delegated.
 
+| `/fix` · `/fix <routine>` | Repair routines: internet, network-reset, printer, sound, search, windows-update, system-files, free-space, slow-pc — approved once as a whole, restore point first when they change the system |
+| `/alerts` · `/alerts on\|off\|check\|reset` | Proactive alerts (see below) |
+
+Plain sentences work too, instantly and without AI: "open bluetooth settings", "screenshot",
+"free up space", "health check", "install vlc", "update all apps", "check for windows updates",
+"fix my printer", "fix the internet", "what windows are open".
+
+### Chat window at the PC (1.5.0)
+
+**Ctrl+Alt+Space** (`CHAT_HOTKEY`) or the tray menu opens a small window with the same
+conversation as Telegram: type or 🎤 speak, approve with the buttons, everything the bot says to
+you appears in both places. It is a loopback-only page (127.0.0.1) opened through a secret
+per-run link; nothing is reachable from the network.
+
+### Both engines use the same tools (MCP)
+
+Claude Code (the default engine) now gets this app's own tools — Settings, screenshots, apps,
+admin jobs, clean-up, health, UI Automation, repair routines, sysadmin, email, PDF — as MCP tools
+(`src/mcp/McpServer.ts`, started by Claude Code itself). Every call goes back through the
+running app's gate: the same policy and the same approvals as everything else.
+
+### Operating apps (UI Automation)
+
+The assistant can see and use the apps on screen through Windows' accessibility tree:
+`ui_list_windows`, `ui_inspect` (numbered list of the buttons, menus and fields of a window),
+`ui_click`, `ui_type`, `ui_keys`, `ui_window` (focus, minimize, maximize, snap left/right, close).
+Looking runs freely; clicking/typing asks — with **"Approve all here for 10 min"** for that one
+window, so a multi-step task doesn't need a tap per click. Closing a window always asks.
+
+### Proactive alerts
+
+Every 10 minutes (`ALERT_INTERVAL_MINUTES`), without AI: system drive almost full, Microsoft
+Defender detections, unexpected shutdowns, a disk reporting a problem, a restart pending for days,
+and **new** programs starting with Windows, new automatic services or new scheduled tasks — the
+usual footprints of unwanted software (compared by name with a baseline taken on the first run,
+so app updates don't count). Sent to Telegram and as a Windows notification, at most once a day
+per condition. `/alerts reset` accepts what is installed now; `ALERTS=false` turns them off.
+
+### Windows notifications
+
+Approval requests also appear as a Windows notification with **Approve / Deny** buttons — answer
+at the PC or in Telegram, the first answer wins and the other is updated. Tasks that run longer
+than `TOAST_LONG_TASK_SECONDS` (60) end with a notification. Nothing to install: the app
+registers its name and an `aiwa:` link type for your user on start. Off: `TOAST_NOTIFICATIONS=false`.
+
+### Administrator helper (optional)
+
+The assistant runs as a normal user, so Windows updates, BitLocker, restore points, services and
+system clean-up need administrator rights. Install the helper **once** from an administrator
+PowerShell (`npm run install-helper`, or `AiWindowsAssistant.exe --install-helper`); remove it with
+`uninstall-helper`. It starts at every logon with highest privileges, without UAC prompts.
+
+- It only runs the fixed jobs in `src/elevated/ops.ts`, with validated parameters (service names
+  from a list, a page-file size range, a winget package id) — never arbitrary commands.
+- Its code is copied to `%ProgramData%\AiWindowsAssistant\helper`, which only administrators can
+  change: starting code from the user-writable project folder as administrator would let any
+  program running as you edit it and become administrator. **After updating the assistant, run
+  the install again** (`/doctor` and `/admin` say when the helper is outdated).
+- Jobs that change the system (installing updates or apps, page file, services, clean-up, sfc)
+  still ask for your approval first; status checks, Defender scans and restore points don't.
+
 ## Security notes
 
 - **Fail-closed access control**: an empty/misconfigured `TELEGRAM_ALLOWED_USERS` disables the
   bot rather than opening it to anyone who finds it.
-- **Destructive-action approval**: both engines require an explicit Telegram approve before
-  running anything destructive-looking. For the Claude Code engine specifically, this is enforced
-  via a `PreToolUse` hook (`scripts/claude-approval-hook.js`) that gates `Bash`, `Write`, `Edit`,
-  and `NotebookEdit` calls — it does **not** currently gate `Read`/`Glob`/`Grep`/`WebFetch`/
-  `WebSearch`/subagent (`Task`) calls, which run unrestricted once `bypassPermissions` is set. This
-  is an accepted tradeoff for a single-owner tool, not an oversight — know it before relying on it.
+- **Commands need approval unless they are known to be read-only** (since 1.3.0, both engines —
+  `src/security/CommandPolicy.ts`). A command runs immediately only when every command in it
+  (pipelines, `;`, `&&`, script blocks, `$( )`) is read-only: `Get-*`, `Test-*`, `Select-*`,
+  `dir`, `ipconfig`, `git status`/`log`/`diff`, `ls`, `cat`, `grep`… Anything else — deleting or
+  overwriting a file, downloads, `iex`, scheduled tasks, registry writes, .NET method calls, file
+  redirection (`>`), running scripts or programs — asks for **Approve/Deny in Telegram** with the
+  reason. Until 1.2.0 it was the other way round: a list of ~20 "dangerous" patterns, and
+  everything not on it (e.g. `Remove-Item file.txt`, `Set-Content`, `iex (iwr …)`) ran unasked.
+  - `TRUSTED_COMMANDS=git,npm,node` skips approval for tools you use all day; their dangerous
+    forms (`git push --force`, `git reset --hard`, `npm publish`, recursive deletes…) still ask.
+  - Writes are free inside `CLAUDE_WORKSPACE` (and `DOCUMENTS_DIR` for the local engine) and ask
+    outside it.
+- **Blocked outright, no Approve button**: credentials and keys (`~/.ssh`, `~/.aws`, browser saved
+  passwords and cookies, Windows password hives, Credential Manager/DPAPI keys, `.pfx`/`.kdbx`/
+  keystores, `.git-credentials`, `.npmrc`, Claude Code's login), this app's own `.env` and `data/`,
+  anything in `SENSITIVE_PATHS`, plus encoded PowerShell (`-EncodedCommand`) and deleting restore
+  points/backups (`vssadmin delete shadows`, `wbadmin delete`). For the Claude Code engine the
+  `PreToolUse` hook also covers `Read`/`Glob`/`Grep`, so they can't read those locations either.
+  `WebFetch`/`WebSearch`/subagents are not gated.
+- **Approval gate token**: the loopback approval server only accepts requests carrying a random
+  per-run token that only the hook it launched knows.
+- **Secrets encrypted at rest**: `AiWindowsAssistant.exe --protect-secrets` (or
+  `npm run protect-secrets`) encrypts the secrets in `.env` with Windows DPAPI for your user
+  (`dpapi:…` values) — useless to another account or another PC. Plain values keep working, with
+  a warning. Commands the assistant runs (and Claude Code) no longer inherit any of these secrets.
+- **`/doctor`** checks everything at once: settings, secrets, Claude Code CLI, that the approval
+  gate refuses requests without its token, the command policy, the AI provider, email login,
+  folders, database. Tests: `npm test`.
 - **No secrets in logs**: an allowlist-based log serializer strips anything shaped like an API key
   or auth header before it can reach the log files, even on request failures.
 - **Scheduled tasks always run unattended**: a Task Scheduler-fired run has no live Telegram

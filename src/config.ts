@@ -8,6 +8,7 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { decryptDpapiEnv } from './security/SecretStore';
 
 // Inside a pkg-packaged binary, __dirname resolves into pkg's read-only virtual
 // snapshot filesystem, not the real directory the .exe lives in on disk — any
@@ -17,7 +18,17 @@ import * as os from 'os';
 const IS_PKG = !!(process as unknown as { pkg?: unknown }).pkg;
 const PROJECT_ROOT = IS_PKG ? path.dirname(process.execPath) : path.resolve(__dirname, '..');
 
-dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
+export const ENV_PATH = path.join(PROJECT_ROOT, '.env');
+dotenv.config({ path: ENV_PATH });
+// secrets stored as dpapi:… (--protect-secrets) are decrypted here, in memory only
+decryptDpapiEnv();
+
+function envList(key: string): string[] {
+  return env(key)
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
 
 export type ProviderName = 'anthropic' | 'ollama-cloud' | 'ollama';
 
@@ -133,6 +144,36 @@ export const config = {
     baseUrl: env('BJAVADECOMPILER_URL').replace(/\/+$/, ''),
     workerApiKey: env('BJAVADECOMPILER_WORKER_API_KEY'),
     pollIntervalMs: envInt('BJAVADECOMPILER_POLL_INTERVAL_MS', 15000),
+  },
+
+  // Command policy (src/security): commands run without approval only when known to be
+  // read-only. TRUSTED_COMMANDS = tools the owner uses all day and doesn't want to approve each
+  // time (e.g. "git,npm,node"); their dangerous forms (force push, recursive delete…) still ask.
+  // SENSITIVE_PATHS = extra protected folders/files no command or tool may touch, ever.
+  security: {
+    trustedCommands: envList('TRUSTED_COMMANDS'),
+    sensitivePaths: envList('SENSITIVE_PATHS'),
+  },
+
+  // Windows notifications: approval requests with Approve/Deny buttons (Telegram keeps
+  // working, first answer wins) and "task finished" for tasks longer than longTaskSeconds.
+  toast: {
+    enabled: env('TOAST_NOTIFICATIONS', 'true').toLowerCase() === 'true',
+    longTaskSeconds: envInt('TOAST_LONG_TASK_SECONDS', 60),
+  },
+
+  // Proactive alerts (AlertService): disk full, Defender detections, crashes, new startup
+  // programs/services/scheduled tasks… without asking. /alerts off|on at runtime.
+  alerts: {
+    enabled: env('ALERTS', 'true').toLowerCase() === 'true',
+    intervalMinutes: envInt('ALERT_INTERVAL_MINUTES', 10),
+  },
+
+  // Chat window at the PC (WebChat): a hotkey opens a small app window (Edge) talking to this
+  // assistant — same engine, same conversation and approvals as Telegram. Loopback only.
+  chatWindow: {
+    enabled: env('CHAT_WINDOW', 'true').toLowerCase() === 'true',
+    hotkey: env('CHAT_HOTKEY', 'Ctrl+Alt+Space'),
   },
 
   autoStart: env('AUTO_START', 'false').toLowerCase() === 'true',

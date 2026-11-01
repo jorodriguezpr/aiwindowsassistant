@@ -15,6 +15,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import type { ToolDefinition } from '../providers/AIProvider';
 import type { ToolResult } from './AITools';
+import { childEnv } from '../security/SecretStore';
 
 const execAsync = promisify(exec);
 
@@ -25,7 +26,7 @@ async function runPowerShellJson(script: string, timeoutMs = 30000): Promise<Too
       timeout: timeoutMs,
       maxBuffer: 2 * 1024 * 1024,
       windowsHide: true,
-      env: { ...process.env, POWERSHELL_TELEMETRY_OPTOUT: '1' },
+      env: childEnv({ POWERSHELL_TELEMETRY_OPTOUT: '1' }),
     });
     const trimmed = stdout.trim();
     if (!trimmed) return { success: true, output: '[]' };

@@ -8,6 +8,8 @@ import { spawn, ChildProcess, execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { config } from '../config';
+import { childEnv } from '../security/SecretStore';
+import { selfCommand, hookCommand } from '../utils/launcher';
 import * as chatState from '../db/ChatStateStore';
 import type { Logger } from '../logger';
 
@@ -130,13 +132,16 @@ export class ClaudeCodeBridge {
   private logger?: Logger;
   /** Port of the local ApprovalHookServer, set once it's listening (index.ts). 0 = not wired yet. */
   private approvalHookPort = 0;
+  /** Per-run secret the hook must present to the ApprovalHookServer. */
+  private approvalHookToken = '';
 
   constructor(logger?: Logger) {
     this.logger = logger;
   }
 
-  setApprovalHookPort(port: number): void {
+  setApprovalHook(port: number, token: string): void {
     this.approvalHookPort = port;
+    this.approvalHookToken = token;
   }
 
   /**
@@ -148,7 +153,6 @@ export class ClaudeCodeBridge {
    * .claude/settings.json.
    */
   private writeHookSettings(): string {
-    const hookScript = path.join(config.projectRoot, 'scripts', 'claude-approval-hook.js');
     const settingsPath = path.join(config.dataDir, 'claude-hooks-settings.json');
     const settings = {
       hooks: {
@@ -158,8 +162,9 @@ export class ClaudeCodeBridge {
             // command-execution path that was left completely ungated until this was found (see
             // EscalationPollService's read-only hook, which caught the same gap and proved it:
             // denying Bash's `dir` just made Claude Code retry via PowerShell unrestricted).
-            matcher: 'Bash|PowerShell|Write|Edit|NotebookEdit',
-            hooks: [{ type: 'command', command: `node "${hookScript}"`, timeout: 300 }],
+            // Read/Glob/Grep too: they run freely, except on protected locations (SensitivePaths).
+            matcher: 'Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit|Read|Glob|Grep|LS|NotebookRead',
+            hooks: [{ type: 'command', command: hookCommand('approval'), timeout: 300 }],
           },
         ],
       },
@@ -167,6 +172,29 @@ export class ClaudeCodeBridge {
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
     return settingsPath;
+  }
+
+  /**
+   * MCP config for one chat: Claude Code starts `<this app> --mcp-server`, which forwards every
+   * tool call to this process's ApprovalHookServer (/tool) with the per-run token. In data/
+   * (protected from the AI by SensitivePaths), rewritten each run since port and token change.
+   */
+  private writeMcpConfig(chatId: number): string {
+    const [command, ...cmdArgs] = selfCommand(['--mcp-server']);
+    const file = path.join(config.dataDir, `claude-mcp-${chatId}.json`);
+    const mcp = {
+      mcpServers: {
+        aiwa: {
+          type: 'stdio',
+          command,
+          args: cmdArgs,
+          env: { AIWA_APPROVAL_PORT: String(this.approvalHookPort), AIWA_APPROVAL_TOKEN: this.approvalHookToken, AIWA_CHAT_ID: String(chatId) },
+        },
+      },
+    };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(mcp, null, 2));
+    return file;
   }
 
   /**
@@ -299,6 +327,8 @@ export class ClaudeCodeBridge {
       args.push('--settings', opts.hookSettingsPath);
     } else if (this.approvalHookPort > 0) {
       args.push('--settings', this.writeHookSettings());
+      // this app's own tools as MCP tools (src/mcp/McpServer.ts) — not for the read-only runs above
+      args.push('--mcp-config', this.writeMcpConfig(chatId));
     } else {
       this.logger?.warn('approval hook server not wired — destructive Claude Code tool calls will not be gated');
     }
@@ -309,11 +339,13 @@ export class ClaudeCodeBridge {
     // Strip ANTHROPIC_API_KEY so `claude` always falls back to its own stored
     // subscription login (`claude login`) rather than an inherited/empty key
     // from this app's own .env silently switching it to metered API billing.
-    const { ANTHROPIC_API_KEY: _unused, ...childEnv } = process.env;
-    void _unused;
+    // childEnv() also drops this app's other secrets (bot token, SMTP password, worker keys):
+    // Claude Code and every command it runs used to inherit them.
+    const env = childEnv();
     if (this.approvalHookPort > 0) {
-      childEnv.AIWA_CHAT_ID = String(chatId);
-      childEnv.AIWA_APPROVAL_PORT = String(this.approvalHookPort);
+      env.AIWA_CHAT_ID = String(chatId);
+      env.AIWA_APPROVAL_PORT = String(this.approvalHookPort);
+      env.AIWA_APPROVAL_TOKEN = this.approvalHookToken;
     }
 
     return new Promise<ClaudeRunResult>((resolve) => {
@@ -321,8 +353,8 @@ export class ClaudeCodeBridge {
       // Extensionless npm shims are POSIX shell scripts — route through cmd as well.
       const needsShell = lower.endsWith('.cmd') || lower.endsWith('.bat') || !lower.endsWith('.exe');
       const proc: ChildProcess = needsShell
-        ? spawn('cmd.exe', ['/c', cli, ...args], { cwd, windowsHide: true, env: childEnv })
-        : spawn(cli, args, { cwd, windowsHide: true, env: childEnv });
+        ? spawn('cmd.exe', ['/c', cli, ...args], { cwd, windowsHide: true, env })
+        : spawn(cli, args, { cwd, windowsHide: true, env });
 
       // Swallow EPIPE/etc if the child exits before (or while) we're still writing — e.g. a bad
       // CLI path — so that shows up as the normal 'error'/'close' handling below instead of an

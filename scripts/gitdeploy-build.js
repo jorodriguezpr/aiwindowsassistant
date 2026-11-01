@@ -24,7 +24,7 @@ const ROOT = path.join(__dirname, '..');
 const OUT = path.join(ROOT, 'gitdeploy');
 
 // Directories copied in full (source only — no build output, no runtime state).
-const DIRS = ['src', 'scripts'];
+const DIRS = ['src', 'scripts', 'installer', 'tests'];
 // Individual files copied as-is.
 const FILES = ['package.json', 'package-lock.json', 'tsconfig.json', '.gitignore', '.env.example', 'README.md', 'LICENSE'];
 // Generated-at-runtime files that can land inside an otherwise-source directory

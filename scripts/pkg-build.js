@@ -38,26 +38,23 @@ function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
   console.log('Running pkg...');
-  execSync('npx pkg . --output pkg-dist/AiWindowsAssistant.exe', { cwd: ROOT, stdio: 'inherit' });
+  // --fallback-to-source: files V8 can't precompile (pdfkit's brotli) ship as plain source instead of being left out
+  execSync('npx pkg . --fallback-to-source --output pkg-dist/AiWindowsAssistant.exe', { cwd: ROOT, stdio: 'inherit' });
 
-  // Loose files that must exist as real files next to the exe, not just inside it —
-  // config.ts resolves projectRoot/dataDir/logDir/assetsDir against the real exe
-  // directory when packaged, so anything looked up through those paths (the hook
-  // script, the tray icon) needs to actually be there, not just pkg-bundled.
-  const looseFiles = ['.env.example', 'README.md', 'LICENSE'];
-  fs.mkdirSync(path.join(OUT_DIR, 'scripts'), { recursive: true });
+  // Loose files next to the exe. Since 1.5.0 the Claude Code hooks, scheduled tasks and the MCP
+  // server run through the exe itself (src/main.ts), so no .js scripts — and no Node.js — are
+  // needed on the target PC. config.ts resolves assets/.env/data/logs against the exe's folder.
   fs.mkdirSync(path.join(OUT_DIR, 'assets'), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'scripts', 'claude-approval-hook.js'), path.join(OUT_DIR, 'scripts', 'claude-approval-hook.js'));
-  fs.copyFileSync(path.join(ROOT, 'scripts', 'claude-readonly-hook.js'), path.join(OUT_DIR, 'scripts', 'claude-readonly-hook.js'));
   fs.copyFileSync(path.join(ROOT, 'assets', 'icon.ico'), path.join(OUT_DIR, 'assets', 'icon.ico'));
-  for (const f of looseFiles) {
+  fs.copyFileSync(path.join(ROOT, 'installer', 'AiWindowsAssistant.vbs'), path.join(OUT_DIR, 'AiWindowsAssistant.vbs'));
+  for (const f of ['.env.example', 'README.md', 'LICENSE']) {
     const src = path.join(ROOT, f);
     if (fs.existsSync(src)) fs.copyFileSync(src, path.join(OUT_DIR, f));
   }
 
   console.log(`\npkg-dist/ ready at ${OUT_DIR}`);
-  console.log('Contents: AiWindowsAssistant.exe, scripts/claude-approval-hook.js, scripts/claude-readonly-hook.js, .env.example, README.md, LICENSE');
-  console.log('To run: copy .env.example to .env next to the exe, edit it, then run AiWindowsAssistant.exe.');
+  console.log('Contents: AiWindowsAssistant.exe, AiWindowsAssistant.vbs (hidden start), assets/icon.ico, .env.example, README.md, LICENSE');
+  console.log('Next: npm run installer (Windows Setup), or copy .env.example to .env next to the exe and start AiWindowsAssistant.vbs.');
 }
 
 main();

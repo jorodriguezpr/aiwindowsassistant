@@ -1,8 +1,8 @@
 {
   "name": "aiwindowsassistant",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "description": "Windows 11 port of AiAgentAssistant — Telegram-controlled AI assistant with Claude Code bridge, running from the system tray",
-  "main": "dist/index.js",
+  "main": "dist/main.js",
   "author": {
     "name": "Jose Rodriguez Arroyo",
     "email": "jrpcone@gmail.com",
@@ -16,15 +16,21 @@
   "bugs": {
     "url": "https://github.com/jorodriguezpr/aiwindowsassistant/issues"
   },
-  "bin": "dist/index.js",
+  "bin": "dist/main.js",
   "scripts": {
     "dev": "ts-node src/index.ts",
     "build": "tsc && npm run icon",
     "icon": "node scripts/generate-icon.js",
     "start": "node dist/index.js",
+    "test": "tsc && node --test tests/security.test.js tests/windows.test.js tests/assistant15.test.js",
+    "protect-secrets": "node dist/index.js --protect-secrets",
+    "install-helper": "node dist/index.js --install-helper",
+    "uninstall-helper": "node dist/index.js --uninstall-helper",
     "postinstall": "node scripts/generate-icon.js",
     "gitdeploy": "node scripts/gitdeploy-build.js",
-    "pkg-build": "node scripts/pkg-build.js"
+    "pkg-build": "node scripts/pkg-build.js",
+    "installer": "node scripts/installer-build.js",
+    "release": "npm run build && npm test && npm run pkg-build && npm run installer"
   },
   "license": "MIT",
   "pkg": {

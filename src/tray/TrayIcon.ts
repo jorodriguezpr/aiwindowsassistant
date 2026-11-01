@@ -15,6 +15,8 @@ import type { Logger } from '../logger';
 export interface TrayCallbacks {
   onPauseToggle: () => boolean; // returns new paused state
   onTestMessage: () => void;
+  /** 1.5.0: the chat window at the PC (undefined = not running) */
+  onOpenChat?: () => void;
   onQuit: () => void;
 }
 
@@ -61,6 +63,7 @@ export class TrayIcon {
       { title: this.statusText, tooltip: 'AI provider / model', checked: false, enabled: false },
       { title: SEPARATOR, tooltip: '', checked: false, enabled: true },
       { title: this.paused ? '▶ Resume bot' : '⏸ Pause bot', tooltip: 'Toggle Telegram message processing', checked: false, enabled: true },
+      ...(this.callbacks.onOpenChat ? [{ title: `💬 Open chat window (${config.chatWindow.hotkey})`, tooltip: 'Chat with the assistant at the PC', checked: false, enabled: true }] : []),
       { title: '📩 Send test message', tooltip: 'Send a test Telegram message to the owner', checked: false, enabled: true },
       { title: '📂 Open logs folder', tooltip: config.logDir, checked: false, enabled: true },
       { title: '⚙ Open config (.env)', tooltip: 'Edit configuration', checked: false, enabled: true },
@@ -89,6 +92,8 @@ export class TrayIcon {
       const title = action.item.title;
       if (title.includes('Pause bot') || title.includes('Resume bot')) {
         this.setPaused(this.callbacks.onPauseToggle());
+      } else if (title.includes('Open chat window')) {
+        this.callbacks.onOpenChat?.();
       } else if (title.includes('test message')) {
         this.callbacks.onTestMessage();
       } else if (title.includes('logs folder')) {

@@ -4,7 +4,17 @@
  * GitHub: https://github.com/jorodriguezpr/aiwindowsassistant
  */
 
-import { config, ensureDirectories, validateConfig, HOSTNAME } from './config';
+import { config, ensureDirectories, validateConfig, HOSTNAME, ENV_PATH } from './config';
+import { protectEnvFile, plaintextSecrets, secretWarnings } from './security/SecretStore';
+import { installHelper, uninstallHelper, queueDir } from './elevated/client';
+import { runElevatedHelper } from './elevated/helper';
+import { writeRuntimeFile, forwardToastAction } from './services/ToastService';
+import { runMcpServer } from './mcp/McpServer';
+import { uninstallCleanup } from './utils/uninstall';
+import { WebChat } from './gateways/WebChat';
+import { AlertService } from './services/AlertService';
+import * as fs from 'fs';
+import * as path from 'path';
 import { createLogger } from './logger';
 import { TelegramGateway } from './gateways/TelegramGateway';
 import { ClaudeCodeBridge } from './tools/ClaudeCodeBridge';
@@ -17,7 +27,51 @@ import { addAutostart, isAutostartEnabled } from './utils/autostart';
 import { getDb } from './db/Database';
 import { getRunningPendingTasks, finishPendingTask } from './db/ChatStateStore';
 
+function appVersion(): string {
+  try {
+    return (JSON.parse(fs.readFileSync(path.join(config.projectRoot, 'package.json'), 'utf8')) as { version: string }).version;
+  } catch {
+    return '1.5.0';
+  }
+}
+
 async function main(): Promise<void> {
+  // started by Claude Code (--mcp-config): this app's tools over MCP. First, and nothing may print to stdout.
+  if (process.argv.includes('--mcp-server')) {
+    runMcpServer(appVersion());
+    return;
+  }
+  // `AiWindowsAssistant --protect-secrets`: encrypt the secrets in .env with DPAPI, then exit
+  if (process.argv.includes('--protect-secrets')) {
+    const done = protectEnvFile(ENV_PATH);
+    console.log(done.length ? `Encrypted with Windows DPAPI (this user, this PC): ${done.join(', ')}` : 'No plain-text secrets left in .env.');
+    return;
+  }
+  // administrator helper (src/elevated): install/remove from an admin prompt; the pkg .exe also runs it
+  if (process.argv.includes('--install-helper')) {
+    console.log(installHelper());
+    return;
+  }
+  if (process.argv.includes('--uninstall-cleanup')) {
+    const removed = uninstallCleanup();
+    console.log(removed.length ? `Removed: ${removed.join(', ')}` : 'Nothing of this install was registered.');
+    return;
+  }
+  if (process.argv.includes('--uninstall-helper')) {
+    console.log(uninstallHelper());
+    return;
+  }
+  const helperArg = process.argv.indexOf('--elevated-helper');
+  if (helperArg >= 0) {
+    await runElevatedHelper(process.argv[helperArg + 1] || queueDir());
+    return; // keeps running on its timers
+  }
+  // a click on a Windows notification button (aiwa://approve/<nonce>), forwarded to the running app
+  const toastArg = process.argv.indexOf('--toast-action');
+  if (toastArg >= 0) {
+    await forwardToastAction(process.argv[toastArg + 1] || '');
+    return;
+  }
   ensureDirectories();
   const logger = createLogger();
   logger.info({ host: HOSTNAME, pid: process.pid }, 'AiWindowsAssistant starting');
@@ -30,6 +84,9 @@ async function main(): Promise<void> {
 
   const problems = validateConfig();
   for (const p of problems) logger.warn(p);
+  for (const w of secretWarnings) logger.warn(w);
+  const plain = plaintextSecrets(ENV_PATH);
+  if (plain.length > 0) logger.warn({ keys: plain }, 'secrets stored as plain text in .env — run with --protect-secrets to encrypt them');
   if (!config.telegram.token) {
     // console.error (not logger.error) — logger writes async and process.exit()
     // right after can race the stream ("sonic boom is not ready yet").
@@ -58,7 +115,9 @@ async function main(): Promise<void> {
   const approvalServer = new ApprovalHookServer(gateway.requestApproval, logger);
   try {
     const port = await approvalServer.start();
-    claudeBridge.setApprovalHookPort(port);
+    claudeBridge.setApprovalHook(port, approvalServer.token);
+    gateway.setApprovalServer(approvalServer);
+    writeRuntimeFile(port); // where --toast-action finds this process
   } catch (err) {
     logger.warn({ err }, 'approval hook server failed to start — Claude Code destructive actions will not be gated');
   }
@@ -82,8 +141,27 @@ async function main(): Promise<void> {
   bjavaDecompilerPoller.start();
 
   // Tray icon
+  // 1.5.0: chat window at the PC (hotkey / tray) and proactive alerts
+  let webChat: WebChat | null = null;
+  if (config.chatWindow.enabled && config.telegram.allowedUsers.length > 0) {
+    webChat = new WebChat({ onText: (t) => gateway.injectOwnerText(t), onButton: (d) => gateway.answerButton(d, 'chat window') !== null }, logger);
+    try {
+      await webChat.start();
+      gateway.webChat = webChat;
+    } catch (err) {
+      logger.warn({ err }, 'chat window failed to start');
+      webChat = null;
+    }
+  }
+  const alerts = new AlertService(async (text) => {
+    await gateway.notifyOwner(text);
+    gateway.toast.notify('AiWindowsAssistant alert', text);
+  }, logger);
+  gateway.alerts = alerts;
+
   const tray = new TrayIcon(
     {
+      onOpenChat: webChat ? () => webChat?.open() : undefined,
       onPauseToggle: () => {
         gateway.setPaused(!gateway.paused);
         logger.info({ paused: gateway.paused }, 'pause toggled from tray');
@@ -113,6 +191,8 @@ async function main(): Promise<void> {
     }
     gateway.stop(reason);
     approvalServer.stop();
+    webChat?.stop();
+    alerts.stop();
     escalationPoller.stop();
     bjavaDecompilerPoller.stop();
     await tray.kill();
@@ -130,6 +210,8 @@ async function main(): Promise<void> {
   });
 
   await gateway.launch();
+  webChat?.startHotkey();
+  alerts.start();
   tray.setStatus('AI: ready');
   await tray.start();
 
