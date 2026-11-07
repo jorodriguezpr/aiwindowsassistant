@@ -8,7 +8,7 @@ Developer: **Jose Rodriguez Arroyo** — [jrpcone@gmail.com](mailto:jrpcone@gmai
 GitHub: https://github.com/jorodriguezpr/aiwindowsassistant
 Site: [microrepair.net](https://microrepair.net) — *Serving the Internet Community since 1999*
 
-Developer: Jose Rodriguez Arroyo  
+Contributors:  
 11/6/2026 - @mattabate  Pause Issue - /pause did not really pause the bot - Fixed v1.7.1
 
 ---
