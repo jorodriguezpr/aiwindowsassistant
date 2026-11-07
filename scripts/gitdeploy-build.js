@@ -26,7 +26,7 @@ const OUT = path.join(ROOT, 'gitdeploy');
 // Directories copied in full (source only — no build output, no runtime state).
 const DIRS = ['src', 'scripts', 'installer', 'tests'];
 // Individual files copied as-is.
-const FILES = ['package.json', 'package-lock.json', 'tsconfig.json', '.gitignore', '.env.example', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'SYSAIBRAIN-AVATAR-LICENSE.txt'];
+const FILES = ['package.json', 'package-lock.json', 'tsconfig.json', '.gitignore', '.env.example', 'README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'SYSAIBRAIN-AVATAR-LICENSE.txt'];
 // Generated-at-runtime files that can land inside an otherwise-source directory
 // (e.g. scripts/) — these bake in this machine's absolute paths and must never ship.
 const EXCLUDE_PATHS = [path.join('scripts', 'start-hidden.vbs')];

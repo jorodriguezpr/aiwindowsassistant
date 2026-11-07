@@ -101,7 +101,7 @@ At the PC: Ctrl+Alt+Space opens a chat window with this same conversation.
 /clear — Reset conversation + Claude Code session
 /tasks — What the AI is doing right now (running, waiting for approval, queued)
 /cancel — Stop your running and queued work · /cancel all — everything, workers too · /cancel <n> — one item (or just say "cancel" / "stop")
-/pause, /resume — Pause/resume the bot
+/pause, /resume — Pause/resume the bot (while paused only /status, /tasks, /cancel, /help and Deny work)
 /remember <fact> — Save a durable note (both engines see it)
 /notes [search] — List/search saved notes
 /schedule add <name> <daily HH:mm|weekly <day> HH:mm|hourly> <prompt> — Recurring task (real Windows Task Scheduler, runs even if this app isn't open — always unattended, destructive actions are skipped)
@@ -110,6 +110,20 @@ At the PC: Ctrl+Alt+Space opens a chat window with this same conversation.
 /help — This list
 
 Or just type naturally — fast local actions run instantly (e.g. "open notepad", "system info"), anything else is delegated to Claude Code.`;
+
+/** Commands that still answer while the bot is paused: they only report state or STOP work. */
+const PAUSE_ALLOWED_COMMANDS = new Set(['resume', 'pause', 'status', 'help', 'start', 'tasks', 'cancel']);
+
+/**
+ * While paused, only the commands above get through, plus the ❌ Deny button of an approval that was
+ * asked before the pause (denying never acts on the PC). Everything else - other commands, plain text,
+ * photos, files, Approve / "approve all" buttons - is refused. `/cmd@BotName` counts as `/cmd`.
+ */
+export function allowedWhilePaused(isButton: boolean, text: string, buttonData = ''): boolean {
+  if (isButton) return /^deny:/.test(buttonData);
+  const m = /^\/([a-z0-9_]+)(?:@\w+)?(?:\s|$)/i.exec(text.trim());
+  return !!m && PAUSE_ALLOWED_COMMANDS.has(m[1].toLowerCase());
+}
 
 export class TelegramGateway {
   private bot: Telegraf;
@@ -203,6 +217,19 @@ export class TelegramGateway {
         await ctx.reply(`⛔ Unauthorized. Your chat ID is: ${chatId}`);
         this.logger?.warn({ chatId }, 'unauthorized access attempt');
         return;
+      }
+      // Paused (from /pause or the tray): ONE check for every update - commands, text, photos, files and
+      // approval buttons - so no handler can act on the PC while paused. Only commands that report or
+      // stop work get through (see allowedWhilePaused).
+      if (this.paused) {
+        const isButton = !!ctx.callbackQuery;
+        const text = (ctx.message as { text?: string } | undefined)?.text || '';
+        const data = (ctx.callbackQuery as { data?: string } | undefined)?.data || '';
+        if (!allowedWhilePaused(isButton, text, data)) {
+          if (isButton) await ctx.answerCbQuery('⏸ Bot is paused - /resume first').catch(() => undefined);
+          else await ctx.reply('⏸ Bot is paused. Use /resume to continue.');
+          return;
+        }
       }
       return next();
     });
@@ -403,7 +430,7 @@ export class TelegramGateway {
 
     this.bot.command('pause', async (ctx) => {
       this.setPaused(true);
-      await ctx.reply('⏸ Paused. I will ignore new messages until /resume.');
+      await ctx.reply('⏸ Paused. Until /resume I will not act on anything: no commands, messages, photos or approvals (only /status, /tasks, /cancel, /help and Deny still work). Work already running keeps going - /cancel stops it.');
     });
 
     this.bot.command('resume', async (ctx) => {
@@ -826,6 +853,9 @@ export class TelegramGateway {
   answerButton(data: string, via: 'Telegram' | 'chat window'): boolean | null {
     const [action, id] = data.split(':');
     const approved = action === 'appr' || action === 'gr10';
+    // Paused: Approve / "approve all" never go through from any channel (Telegram is also stopped in the
+    // middleware; this covers the chat window). Deny still works.
+    if (approved && this.paused) return null;
     const p = this.pendingApprovals.get(id);
     if (action === 'gr10' && p?.grantKey) grant(p.chatId, p.grantKey, 10);
     return this.settleApproval(id, approved, via) ? approved : null;
@@ -850,6 +880,7 @@ export class TelegramGateway {
 
   /** ApprovalHookServer /toast: a click on a Windows notification's Approve/Deny button. */
   handleToastAction = (nonce: string, approve: boolean): boolean => {
+    if (approve && this.paused) return false; // paused: an Approve click on a Windows notification is ignored
     for (const [id, p] of this.pendingApprovals) if (p.nonce === nonce) return this.settleApproval(id, approve, 'this PC');
     return false;
   };

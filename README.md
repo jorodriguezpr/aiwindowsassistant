@@ -151,7 +151,7 @@ Full list with defaults: see [`.env.example`](.env.example).
 | `/clear` | Reset conversation + Claude Code session for this chat |
 | `/tasks` | What the AI is doing right now: each running task with its engine, time and current step, approvals waiting for you, queued work |
 | `/cancel` · `/cancel all` · `/cancel <n>` | Stop your running and queued work — or everything (workers too) — or one item from `/tasks`. Also by saying "cancel" / "stop" / "cancela". Stopping kills the whole process tree (Claude Code and every command it started, a running PowerShell command and its children); approvals still waiting are withdrawn. An administrator job already running in the helper finishes on its own. |
-| `/pause` / `/resume` | Stop/resume processing new messages |
+| `/pause` / `/resume` | Pause/resume the bot — while paused it acts on nothing (no commands, messages, photos or Approve, from Telegram, the chat window or notifications); only `/status`, `/tasks`, `/cancel`, `/help` and Deny still work |
 | `/remember <fact>` | Save a durable note (both engines see it) |
 | `/notes [search]` | List/search saved notes |
 | `/schedule add <name> <daily HH:mm\|weekly <day> HH:mm\|hourly> <prompt>` | Register a recurring task via Windows Task Scheduler |
@@ -311,6 +311,10 @@ npm run dev      # ts-node, no build step
 npm run build     # tsc + regenerate the tray icon
 npm start         # run the compiled dist/
 ```
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## License
 
